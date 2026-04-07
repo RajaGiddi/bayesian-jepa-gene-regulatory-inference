@@ -1,0 +1,21 @@
+data:
+  network_ids:
+  - 1
+model:
+  d_latent: 256
+  ema_momentum: 0.996
+  encoder_dropout: 0.1
+  encoder_hidden:
+  - 512
+  - 512
+  p0: 10.0
+training:
+  device: cpu
+  eval_every: 1
+  kl_mc_samples: 4
+  kl_warmup_epochs: 50
+  lr: 0.0003
+  stage1_epochs: 3
+  stage2_epochs: 5
+  stage2_lr: 0.001
+  weight_decay: 0.0001

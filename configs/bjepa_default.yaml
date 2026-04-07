@@ -1,0 +1,27 @@
+# B-JEPA two-stage default hyperparameters
+
+model:
+  d_latent: 256
+  encoder_hidden: [512, 512]
+  encoder_dropout: 0.1
+  ema_momentum: 0.996
+  p0: 10.0              # expected nonzero TF regulators per gene (τ₀ formula)
+
+training:
+  # Stage 1: JEPA encoder training
+  stage1_epochs: 150
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+
+  # Stage 2: horseshoe regression in latent space
+  stage2_epochs: 200
+  stage2_lr: 1.0e-3     # higher LR — only W is updated
+  kl_warmup_epochs: 50  # β anneals 0→kl_weight_max over this many stage-2 epochs
+  kl_weight_max: 0.1    # max KL weight; 1.0 over-shrinks all weights to tau0 scale
+  kl_mc_samples: 4
+
+  eval_every: 10
+  device: mps           # Apple Silicon GPU; falls back to cpu if unavailable
+
+data:
+  network_ids: [1, 2, 3, 4]
