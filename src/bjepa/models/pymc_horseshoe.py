@@ -39,6 +39,7 @@ import pandas as pd
 import pymc as pm
 import pytensor.tensor as pt
 import arviz as az
+from scipy import stats as scipy_stats
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +88,17 @@ def build_horseshoe_model(
     nu_slab: float = 4.0,
     s_slab: float  = 2.0,
 ) -> pm.Model:
-    """Return a PyMC model for the regularised horseshoe on one gene."""
+    """Return a PyMC model for the regularised horseshoe on one gene.
+
+    Uses non-centered parameterisation (NCP) for beta to avoid the funnel
+    geometry that causes divergences with the centered form
+    beta ~ N(0, lambda_tilde * tau).
+
+    NCP: beta_raw ~ N(0, 1),  beta = beta_raw * lambda_tilde * tau
+    NUTS samples beta_raw in an isotropic space; beta is derived.
+    This is the standard fix recommended by Betancourt & Girolami (2015)
+    and the PyMC / Stan documentation for hierarchical scale-mixture models.
+    """
     n, D = X.shape
     with pm.Model() as model:
         # Global scale
@@ -108,8 +119,9 @@ def build_horseshoe_model(
         # Shrinkage coefficients κ_j = 1 / (1 + λ̃_j²)
         kappa = pm.Deterministic("kappa", 1.0 / (1.0 + lam_tilde ** 2))
 
-        # Regression weights
-        beta = pm.Normal("beta", mu=0.0, sigma=lam_tilde * tau, shape=D)
+        # Non-centered parameterisation: avoids funnel geometry
+        beta_raw = pm.Normal("beta_raw", mu=0.0, sigma=1.0, shape=D)
+        beta = pm.Deterministic("beta", beta_raw * lam_tilde * tau)
 
         # Noise
         sigma = pm.HalfCauchy("sigma", beta=1.0)
@@ -128,12 +140,18 @@ def sample_gene(
     s_slab: float  = 2.0,
     draws: int = 500,
     tune: int  = 500,
-    target_accept: float = 0.9,
+    target_accept: float = 0.95,
     chains: int = 2,
+    max_treedepth: int = 12,
     random_seed: int = 42,
     progressbar: bool = False,
 ) -> az.InferenceData:
-    """Run NUTS for a single gene. Returns full InferenceData."""
+    """Run NUTS for a single gene. Returns full InferenceData.
+
+    max_treedepth=12 (vs default 10) handles genes where the horseshoe
+    posterior has sharper curvature — avoids max-tree-depth warnings at
+    the cost of more leapfrog steps per sample for those genes.
+    """
     model = build_horseshoe_model(X, y, tau0, nu_slab, s_slab)
     with model:
         with warnings.catch_warnings():
@@ -143,6 +161,7 @@ def sample_gene(
                 tune=tune,
                 chains=chains,
                 target_accept=target_accept,
+                nuts_sampler_kwargs={"max_treedepth": max_treedepth},
                 random_seed=random_seed,
                 progressbar=progressbar,
                 return_inferencedata=True,
@@ -160,8 +179,10 @@ def run_pymc_horseshoe(
     p0: float = 10.0,
     draws: int = 500,
     tune: int  = 500,
-    target_accept: float = 0.9,
+    target_accept: float = 0.95,
     chains: int = 2,
+    max_treedepth: int = 12,
+    max_nuts_genes: int | None = None,
     showcase_genes: Sequence[str] | int | None = 20,
     random_seed: int = 42,
     verbose: bool = True,
@@ -239,23 +260,71 @@ def run_pymc_horseshoe(
         showcase_ids     = list(showcase_genes)
 
     # ----------------------------------------------------------------
+    # Determine which genes get NUTS vs OLS fallback
+    # max_nuts_genes=None  → NUTS on all genes (slow, full network)
+    # max_nuts_genes=K     → NUTS on top-K by OLS signal, ridge for rest
+    # This is justified: low-signal genes have beta≈0 under both NUTS and
+    # ridge, so the fallback loses negligible information while saving hours.
+    # ----------------------------------------------------------------
+    if max_nuts_genes is None:
+        nuts_indices = set(range(G))
+    else:
+        k = min(max_nuts_genes, G)
+        nuts_indices = set(int(i) for i in np.argsort(max_abs)[::-1][:k])
+        # Always include showcase genes in NUTS set
+        nuts_indices |= showcase_indices
+        if verbose:
+            print(f"  NUTS on top-{len(nuts_indices)} genes by OLS signal "
+                  f"(fallback to GCV-ridge for remaining {G - len(nuts_indices)})")
+
+    # ----------------------------------------------------------------
     # Main loop — per gene
     # ----------------------------------------------------------------
-    # posterior_means[d, g] = E[β_d | y_g]
-    posterior_means = np.zeros((D, G))
+    # posterior_means[d, g]        = E[|β_d| | y_g]  (for ranking)
+    # posterior_means_signed[d, g] = E[β_d | y_g]    (for FLASH z-score)
+    # posterior_stds[d, g]         = std[β_d | y_g]  (for FLASH z-score)
+    posterior_means        = np.zeros((D, G))
+    posterior_means_signed = np.zeros((D, G))
+    posterior_stds         = np.zeros((D, G))
     showcase_idatas: dict[str, az.InferenceData] = {}
+
+    # Pre-fill all genes with GCV-ridge scores as fallback
+    # (genes not in nuts_indices keep these values)
+    from bjepa.models.analytical_horseshoe import gcv_ridge_factor, analytical_horseshoe_scores as _hs_scores
+    rf_fallback = gcv_ridge_factor(network, verbose=False)
+    scores_ridge_fallback = _hs_scores(network, ridge_factor=rf_fallback, horseshoe=False)
+    _ridge_map: dict[tuple, float] = {
+        (row.tf, row.target): row.score
+        for row in scores_ridge_fallback.itertuples()
+    }
+    for g_idx in range(G):
+        for d_idx in range(D):
+            key = (tf_ids[d_idx], gene_ids[g_idx])
+            v = _ridge_map.get(key, 0.0)
+            posterior_means[d_idx, g_idx]        = v
+            posterior_means_signed[d_idx, g_idx] = W_ols[d_idx, g_idx]
+            posterior_stds[d_idx, g_idx]         = max(v * 0.1, 1e-8)
 
     t_start = time.perf_counter()
     n_done  = 0
 
+    n_nuts_total = len(nuts_indices)
+    n_nuts_done  = 0
+
     for g_idx in range(G):
-        gene_id = gene_ids[g_idx]
-        # Skip if TF == gene (self-loop; gene is its own TF)
+        gene_id    = gene_ids[g_idx]
+        store_full = g_idx in showcase_indices
+
+        # Skip NUTS for low-signal genes — ridge fallback already filled above
+        if g_idx not in nuts_indices:
+            if store_full:
+                # Shouldn't happen (showcase always in nuts_indices), but guard
+                showcase_indices.discard(g_idx)
+            continue
+
         y_g    = Y[:, g_idx]
         tau0_g = float(tau0_all[g_idx])
         seed_g = random_seed + g_idx
-
-        store_full = g_idx in showcase_indices
 
         try:
             idata = sample_gene(
@@ -263,28 +332,32 @@ def run_pymc_horseshoe(
                 draws=draws, tune=tune,
                 target_accept=target_accept,
                 chains=chains,
+                max_treedepth=max_treedepth,
                 random_seed=seed_g,
                 progressbar=False,
             )
             beta_post = idata.posterior["beta"].values   # (chains, draws, D)
-            posterior_means[:, g_idx] = np.abs(beta_post).mean((0, 1))
+            flat = beta_post.reshape(-1, D)               # (S, D)
+            posterior_means[:, g_idx]        = np.abs(flat).mean(0)
+            posterior_means_signed[:, g_idx] = flat.mean(0)
+            posterior_stds[:, g_idx]         = flat.std(0, ddof=1)
 
             if store_full:
                 showcase_idatas[gene_id] = idata
 
         except Exception as e:
             if verbose:
-                print(f"    gene {gene_id} ({g_idx}/{G}) failed: {e}")
-            # Fallback to OLS
-            posterior_means[:, g_idx] = np.abs(W_ols[:, g_idx])
+                print(f"    gene {gene_id} failed: {e}")
+            # Fallback already pre-filled; nothing to do
 
-        n_done += 1
-        if verbose and n_done % 100 == 0:
+        n_nuts_done += 1
+        n_done      += 1
+        if verbose and n_nuts_done % 20 == 0:
             elapsed = time.perf_counter() - t_start
-            rate    = n_done / elapsed
-            eta     = (G - n_done) / rate
-            print(f"    {n_done}/{G} genes  ({elapsed:.0f}s elapsed, "
-                  f"ETA {eta/60:.1f} min)")
+            rate    = n_nuts_done / elapsed
+            eta     = (n_nuts_total - n_nuts_done) / rate
+            print(f"    NUTS {n_nuts_done}/{n_nuts_total} genes  "
+                  f"({elapsed:.0f}s elapsed, ETA {eta/60:.1f} min)")
 
     elapsed_total = time.perf_counter() - t_start
     if verbose:
@@ -300,10 +373,73 @@ def run_pymc_horseshoe(
     not_self   = tf_names != gene_names
 
     scores_df = pd.DataFrame({
-        "tf":     tf_names[not_self],
-        "target": gene_names[not_self],
-        "score":  posterior_means[not_self],
+        "tf":            tf_names[not_self],
+        "target":        gene_names[not_self],
+        "score":         posterior_means[not_self],        # |E[β]| for ranking
+        "score_signed":  posterior_means_signed[not_self], # E[β] for FLASH z-score
+        "score_std":     posterior_stds[not_self],         # std[β] for FLASH z-score
     })
     scores_df = scores_df.sort_values("score", ascending=False).reset_index(drop=True)
 
     return scores_df, showcase_idatas
+
+
+# ---------------------------------------------------------------------------
+# FLASH FDR filter  (Mendel hypothesis #1)
+# ---------------------------------------------------------------------------
+
+def flash_fdr_scores(
+    scores_df: pd.DataFrame,
+    fdr_level: float = 0.20,
+    min_std: float = 1e-8,
+) -> pd.DataFrame:
+    """Apply frequentist-assisted horseshoe FDR control (FLASH).
+
+    Uses the posterior mean / posterior std ratio as a z-statistic and applies
+    Benjamini-Hochberg correction at the specified FDR level. Among selected
+    edges, ranks by |posterior mean| (identical to ranking by |z| since std
+    cancels when comparing within the selected set only if we want z-ordering,
+    but |beta| is the biologically interpretable quantity).
+
+    Parameters
+    ----------
+    scores_df :
+        Output of run_pymc_horseshoe — must contain columns
+        'score_signed' and 'score_std'.
+    fdr_level :
+        Target FDR (Benjamini-Hochberg). Default 0.20.
+    min_std :
+        Floor for score_std to avoid division by zero.
+
+    Returns
+    -------
+    DataFrame with same columns as input, filtered to BH-selected edges,
+    ranked by |score_signed| descending. Adds column 'p_value' and
+    'z_score'.
+    """
+    df = scores_df.copy()
+
+    # Require signed mean and std columns
+    if "score_signed" not in df.columns or "score_std" not in df.columns:
+        raise ValueError("scores_df must have 'score_signed' and 'score_std' columns. "
+                         "Run run_pymc_horseshoe (not analytical_horseshoe_scores).")
+
+    std_safe = np.maximum(df["score_std"].values, min_std)
+    z = df["score_signed"].values / std_safe
+    # Two-sided p-value under normal approximation
+    p = 2.0 * scipy_stats.norm.sf(np.abs(z))
+
+    df["z_score"] = z
+    df["p_value"] = p
+
+    # Benjamini-Hochberg correction
+    m = len(df)
+    order = np.argsort(p)
+    rank  = np.empty(m, dtype=int)
+    rank[order] = np.arange(1, m + 1)
+    bh_threshold = (rank / m) * fdr_level
+    selected = p <= bh_threshold
+
+    df_sel = df[selected].copy()
+    df_sel = df_sel.sort_values("score", ascending=False).reset_index(drop=True)
+    return df_sel

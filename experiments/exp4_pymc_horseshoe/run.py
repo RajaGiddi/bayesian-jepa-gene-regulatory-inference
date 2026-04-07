@@ -37,7 +37,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 import sys; sys.path.insert(0, str(ROOT / "src"))
 
 from bjepa.data import load_network
-from bjepa.models.pymc_horseshoe import run_pymc_horseshoe, sample_gene, compute_tau0_from_residuals
+from bjepa.models.pymc_horseshoe import (
+    run_pymc_horseshoe, sample_gene, compute_tau0_from_residuals, flash_fdr_scores
+)
 from bjepa.models.analytical_horseshoe import gcv_ridge_factor, analytical_horseshoe_scores
 from bjepa.eval.metrics import evaluate_predictions
 
@@ -87,6 +89,8 @@ def run_network(nid: int, args) -> dict:
         tune=args.tune,
         target_accept=args.target_accept,
         chains=args.chains,
+        max_treedepth=args.max_treedepth,
+        max_nuts_genes=args.max_nuts_genes,
         showcase_genes=args.showcase,
         random_seed=42,
         verbose=True,
@@ -95,8 +99,27 @@ def run_network(nid: int, args) -> dict:
     m_pymc = evaluate_predictions(scores_pymc, net.gold_standard)
     print(f"  PyMC-NUTS  AUROC={m_pymc['auroc']:.4f}  AUPR={m_pymc['aupr']:.4f}  ({elapsed/60:.1f} min)")
 
-    # Save edge scores
+    # Save edge scores (full, with signed mean and std for FLASH)
     scores_pymc.to_csv(out_dir / "edge_scores.csv", index=False)
+
+    # ------------------------------------------------------------------
+    # FLASH FDR filter (Mendel hypothesis #1)
+    # ------------------------------------------------------------------
+    print("\n[FLASH] Applying BH FDR control at 20% ...")
+    try:
+        scores_flash = flash_fdr_scores(scores_pymc, fdr_level=args.fdr_level)
+        m_flash = evaluate_predictions(scores_flash, net.gold_standard)
+        n_sel   = len(scores_flash)
+        n_total = len(scores_pymc)
+        print(f"  FLASH      AUROC={m_flash['auroc']:.4f}  AUPR={m_flash['aupr']:.4f}"
+              f"  ({n_sel}/{n_total} edges selected)")
+        scores_flash[["tf", "target", "score", "z_score", "p_value"]].to_csv(
+            out_dir / "edge_scores_flash.csv", index=False
+        )
+    except Exception as e:
+        print(f"  FLASH failed: {e}")
+        m_flash = {"auroc": float("nan"), "aupr": float("nan")}
+        scores_flash = scores_pymc  # fallback
 
     # ------------------------------------------------------------------
     # Figures
@@ -109,17 +132,21 @@ def run_network(nid: int, args) -> dict:
     # Summary
     # ------------------------------------------------------------------
     result = {
-        "network":          f"net{nid} ({net.name})",
-        "pymc_auroc":       m_pymc["auroc"],
-        "pymc_aupr":        m_pymc["aupr"],
-        "ridge_auroc":      m_ridge["auroc"],
-        "ridge_aupr":       m_ridge["aupr"],
-        "n_showcase_genes": len(showcase_idatas),
-        "draws":            args.draws,
-        "tune":             args.tune,
-        "chains":           args.chains,
-        "p0":               args.p0,
-        "elapsed_min":      round(elapsed / 60, 1),
+        "network":           f"net{nid} ({net.name})",
+        "pymc_auroc":        m_pymc["auroc"],
+        "pymc_aupr":         m_pymc["aupr"],
+        "flash_auroc":       m_flash["auroc"],
+        "flash_aupr":        m_flash["aupr"],
+        "flash_n_selected":  len(scores_flash),
+        "flash_fdr_level":   args.fdr_level,
+        "ridge_auroc":       m_ridge["auroc"],
+        "ridge_aupr":        m_ridge["aupr"],
+        "n_showcase_genes":  len(showcase_idatas),
+        "draws":             args.draws,
+        "tune":              args.tune,
+        "chains":            args.chains,
+        "p0":                args.p0,
+        "elapsed_min":       round(elapsed / 60, 1),
     }
     with open(out_dir / "result.json", "w") as f:
         json.dump(result, f, indent=2)
@@ -374,13 +401,16 @@ def print_comparison(results: list[dict]) -> None:
         net = r["network"]
         rows[net] = {}
         if g3 is not None and net in g3.index:
-            rows[net]["GENIE3 AUPR"]   = g3.loc[net, "aupr"]
-        rows[net]["GCV-Ridge AUPR"] = r["ridge_aupr"]
-        rows[net]["PyMC-NUTS AUPR"] = r["pymc_aupr"]
+            rows[net]["GENIE3 AUPR"]        = g3.loc[net, "aupr"]
+        rows[net]["GCV-Ridge AUPR"]         = r["ridge_aupr"]
+        rows[net]["PyMC-NUTS AUPR"]         = r["pymc_aupr"]
+        rows[net]["PyMC+FLASH AUPR"]        = r.get("flash_aupr", float("nan"))
+        rows[net]["FLASH selected"]         = r.get("flash_n_selected", 0)
         if g3 is not None and net in g3.index:
-            rows[net]["Δ vs GENIE3"]  = r["pymc_aupr"] - g3.loc[net, "aupr"]
+            rows[net]["Δ NUTS vs GENIE3"]   = r["pymc_aupr"] - g3.loc[net, "aupr"]
+            rows[net]["Δ FLASH vs GENIE3"]  = r.get("flash_aupr", float("nan")) - g3.loc[net, "aupr"]
 
-    print("\n\nPyMC NUTS Horseshoe vs baselines:")
+    print("\n\nPyMC NUTS Horseshoe + FLASH vs baselines:")
     print(pd.DataFrame(rows).T.to_string(float_format="{:.4f}".format))
 
 
@@ -398,6 +428,14 @@ def main():
     parser.add_argument("--target_accept", type=float, default=0.9)
     parser.add_argument("--showcase",      type=int,   default=20,
                         help="Number of genes to store full InferenceData for figures.")
+    parser.add_argument("--fdr_level",      type=float, default=0.20,
+                        help="FLASH BH FDR target level (default 0.20).")
+    parser.add_argument("--max_treedepth",  type=int,   default=12,
+                        help="NUTS max tree depth (default 12).")
+    parser.add_argument("--max_nuts_genes", type=int,   default=None,
+                        help="Run NUTS on only the top-K genes by OLS signal. "
+                             "Remainder use GCV-ridge fallback. "
+                             "None (default) = NUTS on all genes.")
     args = parser.parse_args()
 
     nids = [args.network] if args.network else [1, 2, 3, 4]
