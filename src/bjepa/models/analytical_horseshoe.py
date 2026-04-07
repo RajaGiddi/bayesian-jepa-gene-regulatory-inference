@@ -159,3 +159,90 @@ def analytical_horseshoe_scores(
         "score":  abs_beta[not_self],
     })
     return df.sort_values("score", ascending=False).reset_index(drop=True)
+
+
+def gcv_ridge_factor(
+    network,
+    alpha_grid: np.ndarray | None = None,
+    verbose: bool = True,
+) -> float:
+    """Find the ridge_factor minimising GCV prediction error via SVD.
+
+    GCV(α) = ||Y - X·Ŵ_α||²_F / (n · (1 - trace(H_α)/n)²)
+
+    where H_α = X(XᵀX + αI)⁻¹Xᵀ and trace(H_α) = Σⱼ dⱼ²/(dⱼ² + α),
+    with dⱼ the singular values of X.  Evaluating GCV across a grid of α
+    requires only one SVD of X (O(n·p²)) plus O(|grid|·n·p) work for
+    residuals — all negligible compared to expression data loading.
+
+    Parameters
+    ----------
+    network:
+        DREAM5Network instance.
+    alpha_grid:
+        Absolute ridge values to search (not ridge_factor).
+        Defaults to 60 log-spaced values from 1e-4 to 1e4·n.
+    verbose:
+        Print GCV curve and selected α.
+
+    Returns
+    -------
+    float
+        Optimal ridge_factor = α* / n.
+    """
+    expr = network.expression.values.astype(np.float64)
+    n    = expr.shape[0]
+
+    gene_mean = expr.mean(axis=0, keepdims=True)
+    gene_std  = np.maximum(expr.std(axis=0, keepdims=True), 1e-8)
+    expr_std  = (expr - gene_mean) / gene_std
+
+    gene_ids   = network.gene_ids
+    tf_set     = set(network.tf_ids)
+    tf_indices = [i for i, g in enumerate(gene_ids) if g in tf_set]
+
+    X = expr_std[:, tf_indices]   # (n, p)
+    Y = expr_std                   # (n, G)
+    p = X.shape[1]
+
+    # SVD of X once
+    U, d, Vt = np.linalg.svd(X, full_matrices=False)   # d: (p,)
+    d2 = d ** 2                                          # (p,)
+    UtY = U.T @ Y                                        # (p, G)
+    residual_base = Y - U @ UtY                          # component of Y orthogonal to col(X)
+
+    if alpha_grid is None:
+        alpha_grid = np.logspace(-4, math.log10(1e4 * n), 60)
+
+    gcv_scores = []
+    for alpha in alpha_grid:
+        # Hat-matrix trace: tr(H_α) = Σⱼ dⱼ²/(dⱼ² + α)
+        trace_H = (d2 / (d2 + alpha)).sum()
+
+        # Fitted values: Ŷ = U · diag(dⱼ²/(dⱼ²+α)) · UᵀY
+        shrink   = d2 / (d2 + alpha)                   # (p,)
+        Y_hat    = U @ (shrink[:, np.newaxis] * UtY)   # (n, G)
+        residuals = Y - Y_hat                           # (n, G)
+
+        rss = (residuals ** 2).sum()                   # scalar
+        denom = n * (1.0 - trace_H / n) ** 2
+        gcv_scores.append(rss / denom)
+
+    gcv_scores = np.array(gcv_scores)
+    best_idx   = int(np.argmin(gcv_scores))
+    alpha_star = alpha_grid[best_idx]
+    rf_star    = alpha_star / n
+
+    if verbose:
+        print(f"  GCV calibration  n={n}  p={p}  n/p={n/p:.2f}")
+        print(f"  alpha* = {alpha_star:.4g}  →  ridge_factor = {rf_star:.4g}  "
+              f"(GCV={gcv_scores[best_idx]:.4g})")
+        # Show a few landmark GCV values
+        landmarks = [0, len(alpha_grid)//4, len(alpha_grid)//2,
+                     3*len(alpha_grid)//4, len(alpha_grid)-1]
+        for i in landmarks:
+            marker = " ← best" if i == best_idx else ""
+            print(f"    α={alpha_grid[i]:.3g}  rf={alpha_grid[i]/n:.3g}  "
+                  f"GCV={gcv_scores[i]:.4g}{marker}")
+
+    return rf_star

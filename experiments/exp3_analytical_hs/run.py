@@ -31,7 +31,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 import sys; sys.path.insert(0, str(ROOT / "src"))
 
 from bjepa.data import load_network
-from bjepa.models.analytical_horseshoe import analytical_horseshoe_scores
+from bjepa.models.analytical_horseshoe import analytical_horseshoe_scores, gcv_ridge_factor
 from bjepa.eval.metrics import evaluate_predictions
 
 DATA_DIR         = ROOT / "data"
@@ -78,6 +78,7 @@ def run_network(
     p0: float | None = None,
     alpha_scale: float | None = None,
     ridge_factor: float | None = None,
+    calibrate: bool = False,
 ) -> dict:
     net = load_network(DATA_DIR, nid)
     if net.gold_standard is None:
@@ -86,8 +87,13 @@ def run_network(
 
     _p0          = p0 if p0 is not None else DEFAULT_P0[nid]
     _alpha_scale = alpha_scale if alpha_scale is not None else DEFAULT_ALPHA_SCALE[nid]
-    _ridge       = ridge_factor if ridge_factor is not None else DEFAULT_RIDGE[nid]
     alpha        = _alpha_scale * net.n_samples
+
+    if calibrate:
+        print(f"  Running GCV calibration...")
+        _ridge = gcv_ridge_factor(net, verbose=True)
+    else:
+        _ridge = ridge_factor if ridge_factor is not None else DEFAULT_RIDGE[nid]
 
     print(f"\n{'='*60}")
     print(f"net{nid} ({net.name})  "
@@ -210,6 +216,8 @@ def main():
                         help="MAP prior precision as multiple of n. Default: per-network.")
     parser.add_argument("--ridge_factor", type=float, default=None,
                         help="OLS ridge as fraction of n (e.g. 0.05 stabilises net2). Default: per-network.")
+    parser.add_argument("--calibrate", action="store_true",
+                        help="Use GCV to find optimal ridge_factor per network instead of DEFAULT_RIDGE.")
     args = parser.parse_args()
 
     nids = [args.network] if args.network else [1, 2, 3, 4]
@@ -220,6 +228,7 @@ def main():
             nid, p0=args.p0,
             alpha_scale=args.alpha_scale,
             ridge_factor=args.ridge_factor,
+            calibrate=args.calibrate,
         )
         if result:
             all_results.append(result)
