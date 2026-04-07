@@ -372,12 +372,18 @@ def run_pymc_horseshoe(
     gene_names = np.repeat(gene_arr[None, :], D, axis=0)  # (D, G)
     not_self   = tf_names != gene_names
 
+    # is_nuts[d, g] = True if gene g was sampled with NUTS, False = ridge fallback
+    is_nuts_mat = np.zeros((D, G), dtype=bool)
+    for g_idx in nuts_indices:
+        is_nuts_mat[:, g_idx] = True
+
     scores_df = pd.DataFrame({
         "tf":            tf_names[not_self],
         "target":        gene_names[not_self],
         "score":         posterior_means[not_self],        # |E[β]| for ranking
         "score_signed":  posterior_means_signed[not_self], # E[β] for FLASH z-score
         "score_std":     posterior_stds[not_self],         # std[β] for FLASH z-score
+        "is_nuts":       is_nuts_mat[not_self],            # True = calibrated posterior
     })
     scores_df = scores_df.sort_values("score", ascending=False).reset_index(drop=True)
 

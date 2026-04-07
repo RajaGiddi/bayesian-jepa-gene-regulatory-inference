@@ -96,8 +96,31 @@ The mechanism is a gradient magnitude imbalance: the KL gradient on $m_\lambda$ 
 
 The B-JEPA VI result on net2 (AUPR = 0.016) still exceeds GENIE3 (AUPR = 0.011), because even implicit ridge from KL regularisation stabilises the ill-conditioned $n/D = 1.6$ regime. However, the analytical GCV-ridge (AUPR = 0.018) — which makes the same ridge mechanism explicit and data-adaptive — outperforms it.
 
-## 3.7 Summary
+## 3.7 NUTS Horseshoe and FLASH FDR on net2
 
-The complete ablation hierarchy reveals a monotone ordering: GCV calibration is the most important design decision, and all architectural elaborations beyond explicit ridge regression do not improve — and often degrade — performance.
+We ran the PyMC regularised horseshoe (Section 2.7) with NUTS on the top 200 highest-signal genes of net2 ($S$. aureus, $n/D = 1.62$). Arviz diagnostics for the 20 showcase genes confirm that the non-centered parameterisation (NCP) substantially reduces divergent transitions (from $\geq 1000$ to $< 10$ per gene) and that the theoretically expected bimodal shrinkage profile emerges: the posterior of $\kappa_d = 1/(1 + \tilde{\lambda}_d^2)$ concentrates near 0 for the few TFs with detectable signal and near 1 for the majority, in contrast to the mean-field VI collapse at $\kappa \approx 0.49$ (Section 3.6).
+
+**FLASH FDR results.** Applying the FLASH procedure (Section 2.7.2) to the 19,800 NUTS-evaluated edges at FDR $\leq 20\%$ selected **89 edges**. The AUPR of these 89 edges against the net2 gold standard is 0.0015 (AUROC = 0.4998), indistinguishable from random. GCV-calibrated ridge achieves AUPR = 0.0175 on the full network.
+
+**Table 6. NUTS + FLASH vs baselines on net2.**
+
+| Method | AUPR | AUROC | Edges evaluated | Notes |
+|--------|------|-------|-----------------|-------|
+| GENIE3 | 0.0112 | 0.678 | All | |
+| GCV-Ridge | 0.0175 | 0.650 | All | Best overall |
+| NUTS (top-200 genes) | 0.0016* | — | 19,800 | *subset only |
+| NUTS + FLASH (FDR 20%) | 0.0015 | 0.4998 | 89 selected | Fails |
+
+*NUTS AUPR evaluated on the top-200 gene subset only — not comparable to full-network methods.
+
+The FLASH result is consistent with the underdetermination hypothesis: at $n/D = 1.62$, posterior widths on all $\beta_{dg}$ are large relative to posterior means. Z-scores (posterior mean / posterior std) are uniformly small, providing insufficient discrimination between true and false regulatory edges. BH correction selects 89 edges that happen to have slightly tighter posteriors, but these are not enriched for gold-standard positives. The data-scarcity regime that limits ranking-based methods (Section 3.2) equivalently limits posterior-based discovery: there is not enough information in 160 samples to make calibrated edge-level decisions via FDR control.
+
+The primary value of the NUTS experiment is therefore diagnostic, not competitive: it confirms that correct Bayesian inference produces the intended horseshoe shrinkage geometry (bimodal $\kappa$), while the analytical closed-form and mean-field VI do not — one because it is rank-neutral (Section 3.4), the other because it collapses (Section 3.6).
+
+## 3.8 Summary
+
+The complete ablation hierarchy reveals a monotone ordering: GCV calibration is the most important design decision, and all architectural elaborations beyond explicit ridge regression do not improve — and often degrade — performance. Full Bayesian inference (NUTS) correctly characterises posterior uncertainty but cannot overcome the fundamental information deficit in the small-$n/D$ regime.
 
 **Figure 1 (recommended).** AUPR vs n/D ratio for GENIE3 and GCV-Ridge across all four networks. The crossover from GENIE3-dominant to Ridge-dominant performance occurs between n/D = 2.4 and n/D = 4.1, consistent with the data-scarcity regime where non-parametric ensemble methods overfit.
+
+**Figure 2 (recommended).** Posterior $\kappa$ distribution from NUTS (bimodal) vs VI (collapsed at $\kappa \approx 0.49$) for net2 showcase genes, illustrating the qualitative difference between correct and degenerate horseshoe inference.

@@ -96,30 +96,43 @@ def run_network(nid: int, args) -> dict:
         verbose=True,
     )
     elapsed = time.perf_counter() - t0
-    m_pymc = evaluate_predictions(scores_pymc, net.gold_standard)
-    print(f"  PyMC-NUTS  AUROC={m_pymc['auroc']:.4f}  AUPR={m_pymc['aupr']:.4f}  ({elapsed/60:.1f} min)")
+    print(f"  PyMC-NUTS sampling done ({elapsed/60:.1f} min)")
 
-    # Save edge scores (full, with signed mean and std for FLASH)
-    scores_pymc.to_csv(out_dir / "edge_scores.csv", index=False)
+    # Save full edge scores for inspection
+    scores_pymc.to_csv(out_dir / "edge_scores_nuts_raw.csv", index=False)
+
+    # AUPR for NUTS: only evaluate genes where NUTS was actually run
+    # (mixing NUTS + ridge fallback creates scale mismatch → inverted ranking)
+    scores_nuts_only = scores_pymc[scores_pymc["is_nuts"]].copy() if "is_nuts" in scores_pymc.columns \
+        else scores_pymc.copy()
+    m_pymc = evaluate_predictions(scores_nuts_only, net.gold_standard)
+    print(f"  PyMC-NUTS  AUROC={m_pymc['auroc']:.4f}  AUPR={m_pymc['aupr']:.4f}"
+          f"  (evaluated on NUTS-sampled genes only)")
 
     # ------------------------------------------------------------------
     # FLASH FDR filter (Mendel hypothesis #1)
+    # Applied only to NUTS-evaluated edges — fallback ridge scores have
+    # artificial std (10% of score) that inflates z-scores and causes BH
+    # to select everything. FLASH is only meaningful on calibrated posteriors.
     # ------------------------------------------------------------------
-    print("\n[FLASH] Applying BH FDR control at 20% ...")
+    print("\n[FLASH] Applying BH FDR control at 20% (NUTS edges only)...")
     try:
-        scores_flash = flash_fdr_scores(scores_pymc, fdr_level=args.fdr_level)
+        # Filter to NUTS-only edges before FLASH
+        nuts_mask = scores_pymc.get("is_nuts", pd.Series([True] * len(scores_pymc)))
+        scores_for_flash = scores_pymc[nuts_mask].copy()
+        scores_flash = flash_fdr_scores(scores_for_flash, fdr_level=args.fdr_level)
         m_flash = evaluate_predictions(scores_flash, net.gold_standard)
         n_sel   = len(scores_flash)
-        n_total = len(scores_pymc)
+        n_total = len(scores_for_flash)
         print(f"  FLASH      AUROC={m_flash['auroc']:.4f}  AUPR={m_flash['aupr']:.4f}"
-              f"  ({n_sel}/{n_total} edges selected)")
+              f"  ({n_sel}/{n_total} NUTS edges selected at FDR≤{args.fdr_level:.0%})")
         scores_flash[["tf", "target", "score", "z_score", "p_value"]].to_csv(
             out_dir / "edge_scores_flash.csv", index=False
         )
     except Exception as e:
         print(f"  FLASH failed: {e}")
         m_flash = {"auroc": float("nan"), "aupr": float("nan")}
-        scores_flash = scores_pymc  # fallback
+        scores_flash = pd.DataFrame()
 
     # ------------------------------------------------------------------
     # Figures

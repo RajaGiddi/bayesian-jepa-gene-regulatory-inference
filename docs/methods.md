@@ -100,7 +100,43 @@ The KL is estimated via Monte Carlo with $n_{\text{mc}} = 4$ samples. KL weight 
 
 Edge scores from B-JEPA are $|\mu_{dg} \cdot \tilde{\lambda}_{dg} \cdot \tau / \tau_0|$ evaluated at the variational posterior mode.
 
-## 2.7 GENIE3 Baseline
+## 2.7 Regularised Horseshoe via NUTS and FLASH FDR Control
+
+For a subset of high-signal genes we run full Bayesian inference using the No-U-Turn Sampler (NUTS/HMC) to obtain calibrated posterior distributions over edge weights. This serves two purposes: (i) validating that the theoretically correct horseshoe shrinkage profile (bimodal $\kappa$) emerges when inference is performed correctly, and (ii) enabling posterior-based FDR control via the FLASH procedure (Mendel 2026).
+
+### 2.7.1 PyMC Regularised Horseshoe Model
+
+Per target gene $g$, we fit the Piironen & Vehtari (2017) regularised horseshoe with the following structure:
+
+$$\tau \sim \text{Half-Cauchy}(0, \tau_0), \quad \lambda_d \sim \text{Half-Cauchy}(0, 1), \quad c^2 \sim \text{InvGamma}(\nu/2,\ \nu s^2/2)$$
+
+$$\tilde{\lambda}_d = \frac{\sqrt{c^2}\, \lambda_d}{\sqrt{c^2 + \tau^2 \lambda_d^2}}, \quad \kappa_d = \frac{1}{1 + \tilde{\lambda}_d^2}, \quad \sigma \sim \text{Half-Cauchy}(0, 1)$$
+
+with $\nu = 4$ degrees of freedom and slab scale $s = 2$. We use a **non-centered parameterisation (NCP)** for the regression weights:
+
+$$\beta_d^{\text{raw}} \sim \mathcal{N}(0, 1), \quad \beta_d = \beta_d^{\text{raw}} \cdot \tilde{\lambda}_d \cdot \tau$$
+
+The NCP is essential: the centered form $\beta_d \sim \mathcal{N}(0, \tilde{\lambda}_d^2 \tau^2)$ creates a funnel geometry when $\tau \to 0$ (the sparse regime), producing $\geq 1000$ divergent transitions per gene. The NCP decouples $\beta_d^{\text{raw}}$ from the scale parameters, reducing divergences from 1000/1000 to $<10$ per gene.
+
+Per-gene $\tau_0$ is computed from GCV-ridge residuals (Section 2.4), replacing the less stable OLS residuals:
+
+$$\tau_{0g} = \frac{p_0}{D - p_0} \cdot \frac{\hat{\sigma}_g^{\text{gcv}}}{\sqrt{n}}$$
+
+We run 2 chains × 500 draws (+ 500 tune) with `target_accept = 0.95` and `max_treedepth = 12` using PyMC 5 / JAX. Posterior summaries are inspected via Arviz.
+
+Due to per-gene NUTS runtime of $O(10$–$60)$ seconds, we run full NUTS on the top $K = 200$ genes by OLS coefficient magnitude; remaining genes use GCV-ridge scores as fallback. NUTS-evaluated genes are flagged with `is_nuts=True` in the output for downstream filtering.
+
+### 2.7.2 FLASH FDR Control
+
+We implement a frequentist-assisted horseshoe (FLASH) procedure applied to NUTS posteriors. For each NUTS-evaluated edge $(d, g)$, define:
+
+$$z_{dg} = \frac{\mathbb{E}[\beta_d \mid y_g]}{\text{std}[\beta_d \mid y_g]}$$
+
+Under the normal approximation for the posterior mean estimator, $z_{dg}$ is approximately standard normal under the null $\beta_d = 0$. Two-sided p-values are $p_{dg} = 2\Phi(-|z_{dg}|)$.
+
+Benjamini-Hochberg correction at FDR level $q$ selects edges with $p_{dg} \leq (r_{dg}/m) \cdot q$, where $r_{dg}$ is the rank of $p_{dg}$ among all $m$ NUTS-evaluated edges. Selected edges are ranked by $|\mathbb{E}[\beta_d \mid y_g]|$ for AUPR evaluation. FLASH is applied exclusively to NUTS-evaluated edges; ridge-fallback edges have artificial posterior std (10\% of score) that inflates z-scores and is not suitable for hypothesis testing.
+
+## 2.8 GENIE3 Baseline
 
 GENIE3 (Huynh-Thu et al. 2010) trains an Extra-Trees regressor independently for each target gene, ranking TF importances by the decrease in impurity. We use the implementation from the original DREAM5 challenge with default hyperparameters ($K = \sqrt{D}$ features per split, 1000 trees). GENIE3 is a non-parametric ensemble method that makes no linearity assumption.
 
