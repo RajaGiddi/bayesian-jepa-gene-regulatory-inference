@@ -110,6 +110,10 @@ class ContextEncoder(nn.Module):
     Maps each gene's expression profile (length n_samples) to a d_latent
     vector.  Trained end-to-end with gradients.
 
+    Also carries a log_var_head whose weights are EMA-copied into the
+    TargetEncoder so that q_{theta'}(Z_T | x_T) can be parameterised as a
+    diagonal Gaussian with learned variance (VJEPA, Section 4.2).
+
     Parameters
     ----------
     n_samples:
@@ -134,6 +138,13 @@ class ContextEncoder(nn.Module):
         self.d_latent = d_latent
         self.mlp = _MLP(n_samples, hidden_dims, d_latent, dropout=dropout)
 
+        # Variance head: maps d_latent -> d_latent log-variances.
+        # Initialised so log_var ≈ -2 (variance ≈ 0.14) — small but non-trivial
+        # uncertainty at the start of training.
+        self.log_var_head = nn.Linear(d_latent, d_latent, bias=True)
+        nn.init.zeros_(self.log_var_head.weight)
+        nn.init.constant_(self.log_var_head.bias, -2.0)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
@@ -144,25 +155,28 @@ class ContextEncoder(nn.Module):
         Returns
         -------
         Tensor, shape (n_genes, d_latent)
+            Point embedding (context encoder stays deterministic).
         """
         return self.mlp(x)
 
 
 class TargetEncoder(nn.Module):
-    """EMA copy of ContextEncoder — no direct gradient updates.
+    """EMA copy of ContextEncoder — parameterises the VJEPA inference distribution.
 
-    Weights are updated each training step via:
-        θ_target ← momentum · θ_target + (1 − momentum) · θ_context
+    VJEPA (Huang 2026, Section 4.2) defines an amortised inference distribution:
 
-    This prevents representational collapse (the asymmetric EMA design from
-    I-JEPA / BYOL) without requiring negative samples.
+        q_{theta'}(Z_T | x_T) = N(mu_{theta'}(x_T), diag(exp(log_var_{theta'}(x_T))))
+
+    Both mean and log-variance are parameterised by EMA copies of the
+    ContextEncoder's mlp and log_var_head respectively.  No gradients flow
+    through this encoder — it is updated exclusively via EMA.
 
     Parameters
     ----------
     context_encoder:
         The ContextEncoder whose weights this mirrors.
     momentum:
-        EMA momentum.  0.996 matches the I-JEPA default.
+        EMA momentum.  0.996 matches the I-JEPA / VJEPA default.
     """
 
     def __init__(
@@ -172,10 +186,13 @@ class TargetEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.momentum = momentum
-        # Deep-copy so parameters are independent from the start
-        self.mlp = copy.deepcopy(context_encoder.mlp)
         self.n_samples = context_encoder.n_samples
-        self.d_latent = context_encoder.d_latent
+        self.d_latent  = context_encoder.d_latent
+
+        # Deep-copy both heads so parameters are independent from the start
+        self.mlp          = copy.deepcopy(context_encoder.mlp)
+        self.log_var_head = copy.deepcopy(context_encoder.log_var_head)
+
         # Freeze: target encoder is never updated by the optimiser
         for p in self.parameters():
             p.requires_grad_(False)
@@ -184,21 +201,31 @@ class TargetEncoder(nn.Module):
     def update_ema(self, context_encoder: ContextEncoder) -> None:
         """Pull one EMA step from the current ContextEncoder weights."""
         m = self.momentum
-        for p_target, p_ctx in zip(self.mlp.parameters(), context_encoder.mlp.parameters()):
-            p_target.data.mul_(m).add_(p_ctx.data, alpha=1.0 - m)
+        for p_t, p_c in zip(self.mlp.parameters(),
+                             context_encoder.mlp.parameters()):
+            p_t.data.mul_(m).add_(p_c.data, alpha=1.0 - m)
+        for p_t, p_c in zip(self.log_var_head.parameters(),
+                             context_encoder.log_var_head.parameters()):
+            p_t.data.mul_(m).add_(p_c.data, alpha=1.0 - m)
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Parameterise the inference distribution q_{theta'}(Z_T | x_T).
+
         Parameters
         ----------
         x : Tensor, shape (n_genes, n_samples)
 
         Returns
         -------
-        Tensor, shape (n_genes, d_latent)
+        mu : Tensor, shape (n_genes, d_latent)
+            Posterior mean of the inference distribution.
+        log_var : Tensor, shape (n_genes, d_latent)
+            Log-variance, clamped to [-6, 2] for numerical stability.
         """
-        return self.mlp(x)
+        h       = self.mlp(x)
+        log_var = self.log_var_head(h).clamp(-6.0, 2.0)
+        return h, log_var
 
 
 # ---------------------------------------------------------------------------

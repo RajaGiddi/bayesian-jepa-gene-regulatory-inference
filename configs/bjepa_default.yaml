@@ -6,6 +6,8 @@ model:
   encoder_dropout: 0.1
   ema_momentum: 0.996
   p0: 10.0              # expected nonzero TF regulators per gene (τ₀ formula)
+  stage1_kl_weight: 1.0   # β for KL(q||N(0,I)) in VJEPA ELBO
+  predictor_hidden: 256   # hidden dim of predictor MLP g_φ
 
 training:
   # Stage 1: JEPA encoder training

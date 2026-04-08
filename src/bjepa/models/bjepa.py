@@ -1,12 +1,27 @@
 """B-JEPA: two-stage architecture.
 
-Stage 1 — JEPA encoder training with linear W predictor
----------------------------------------------------------
-Train context + target encoders so that linear combinations of TF latents
-reconstruct target gene latents. W_init carries a rough regulatory signal.
+Stage 1 — VJEPA / BJEPA encoder training (Huang 2026, arXiv:2601.14354)
+-------------------------------------------------------------------------
+Implements the Variational JEPA (VJEPA) objective with the Bayesian JEPA
+(B-JEPA) Product of Experts (PoE) predictor.
 
-    pred_s_target = (s_context.T @ W_init).T
-    L_stage1 = MSE(pred_s_target, stop_grad(s_target))
+VJEPA replaces the deterministic I-JEPA MSE loss with a probabilistic ELBO:
+
+    Target encoder  :  q_{θ'}(Z_T | x_T) = N(μ_q, diag(exp(log_var_q)))
+                       — amortised inference distribution, EMA-updated.
+
+    Dynamics expert :  N(μ_dyn, diag(exp(pred_log_var)))
+                       where μ_dyn = (s_context.T @ W_init).T
+
+    B-JEPA PoE      :  p_φ(Z_T | Z_C, ξ_T) = PoE(dynamics expert, N(0,I))
+                       prec_poe = prec_dyn + 1
+                       var_phi  = 1 / prec_poe
+                       mu_phi   = var_phi * prec_dyn * mu_dyn
+
+    ELBO            :  L = NLL(Z_T ; μ_φ, var_φ) + β · KL(q || N(0,I))
+                       Z_T ~ q (reparameterisation trick)
+                       NLL = 0.5 * mean(log(var_φ) + (Z_T - μ_φ)² / var_φ)
+                       KL  = -0.5 * mean(1 + log_var_q - μ_q² - exp(log_var_q))
 
 Stage 2 — Horseshoe sparse regression in expression space
 ----------------------------------------------------------
@@ -15,7 +30,7 @@ Freeze encoders. Use W_init as a warm start for mu_W.
 Regress raw gene expression on raw TF expression with horseshoe prior:
 
     pred = X_tf @ W          (n_samples, n_genes)
-    L = MSE(pred, Y) + β · KL(q(W) || p_horseshoe)
+    L    = MSE(pred, Y) + β · KL(q(W) || p_horseshoe)
 
 Why expression space (not latent space)
 ----------------------------------------
@@ -47,10 +62,14 @@ from .horseshoe import HorseshoeRegressor, compute_tau0
 
 @dataclass
 class Stage1Output:
-    pred_s_target: torch.Tensor  # (n_genes, d_latent)
-    s_target:      torch.Tensor  # (n_genes, d_latent)
-    s_context:     torch.Tensor  # (n_tfs,  d_latent)
-    loss:          torch.Tensor  # scalar MSE
+    loss:        torch.Tensor  # scalar ELBO = NLL + β·KL
+    nll:         torch.Tensor  # scalar NLL term
+    kl:          torch.Tensor  # scalar KL term
+    mu_q:        torch.Tensor  # (n_genes, d_latent)  inference mean
+    log_var_q:   torch.Tensor  # (n_genes, d_latent)  inference log-var
+    mu_phi:      torch.Tensor  # (n_genes, d_latent)  PoE predictor mean
+    var_phi:     torch.Tensor  # (n_genes, d_latent)  PoE predictor var
+    s_context:   torch.Tensor  # (n_tfs,  d_latent)
 
 
 @dataclass
@@ -65,13 +84,26 @@ class Stage2Output:
 # ---------------------------------------------------------------------------
 
 class BJEPAStage1(nn.Module):
-    """JEPA encoder training with linear W predictor.
+    """VJEPA + B-JEPA encoder training (Huang 2026, arXiv:2601.14354).
 
-    pred_s_target[g] = sum_i W_init[i,g] * s_context[i]
-                     = (s_context.T @ W_init).T
+    Context encoder : s_context = f_θ(x_TF)                      — deterministic
+    Target encoder  : (μ_q, log_var_q) = f_{θ'}(x_all)           — inference dist (EMA)
+    Predictor       : [μ_dyn, log_var_dyn] = g_φ(z_c_g ‖ ξ_g)   — dynamics expert
+    B-JEPA PoE      : p_φ = PoE(dynamics expert, N(0,I))
+    ELBO            : NLL(Z_T ; μ_φ, var_φ) + β · KL(q ‖ N(0,I))
 
-    W_init is regularised by weight_decay (Gaussian L2 prior), identical in
-    form to the horseshoe's slab component before Stage 2 refines it.
+    Two context aggregation modes (selected by use_cross_attention):
+
+    Mean-pool (default):
+        z_c_g = mean(s_context)  — same context vector for all genes.
+        Simple, fast, loses per-TF selectivity.
+
+    Cross-attention (Ablation 3):
+        z_c_g = CrossAttn(query=ξ_g, key=s_context, value=s_context)
+        Each gene attends selectively to individual TF latents.
+        Attention weights a_{g,d} ∈ [0,1] are interpretable as regulatory
+        scores: gene g attending strongly to TF d ≈ TF d regulates gene g.
+        Addresses net3 failure where mean-pool loses TF-selectivity at scale.
     """
 
     def __init__(
@@ -83,11 +115,17 @@ class BJEPAStage1(nn.Module):
         encoder_hidden: Sequence[int] = (512, 512),
         encoder_dropout: float = 0.1,
         ema_momentum: float = 0.996,
+        kl_weight: float = 1.0,
+        predictor_hidden: int = 256,
+        use_cross_attention: bool = False,
+        num_attn_heads: int = 4,
     ) -> None:
         super().__init__()
-        self.n_tfs    = n_tfs
-        self.n_genes  = n_genes
-        self.d_latent = d_latent
+        self.n_tfs               = n_tfs
+        self.n_genes             = n_genes
+        self.d_latent            = d_latent
+        self.kl_weight           = kl_weight
+        self.use_cross_attention = use_cross_attention
 
         self.context_encoder, self.target_encoder = build_encoders(
             n_samples=n_samples,
@@ -97,25 +135,98 @@ class BJEPAStage1(nn.Module):
             ema_momentum=ema_momentum,
         )
 
-        self.W_init = nn.Parameter(
-            torch.empty(n_tfs, n_genes).normal_(0, 1.0 / n_tfs ** 0.5)
+        # Gene-specific position tokens ξ_T — one embedding per gene.
+        # In mean-pool mode: distinguishes genes in the predictor input.
+        # In cross-attention mode: serves as the query for each gene.
+        self.gene_embedding = nn.Embedding(n_genes, d_latent)
+        nn.init.trunc_normal_(self.gene_embedding.weight, std=0.02)
+
+        # Cross-attention: gene embeddings query TF latents.
+        # Need d_latent divisible by num_attn_heads.
+        if use_cross_attention:
+            assert d_latent % num_attn_heads == 0, (
+                f"d_latent ({d_latent}) must be divisible by num_attn_heads ({num_attn_heads})"
+            )
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=d_latent,
+                num_heads=num_attn_heads,
+                dropout=0.0,
+                batch_first=True,
+            )
+
+        # Predictor MLP: (z_c_g ‖ ξ_g) → (μ_dyn ‖ log_var_dyn)
+        # z_c_g is either mean-pooled or cross-attended TF context.
+        self.predictor = nn.Sequential(
+            nn.Linear(2 * d_latent, predictor_hidden),
+            nn.GELU(),
+            nn.LayerNorm(predictor_hidden),
+            nn.Linear(predictor_hidden, 2 * d_latent),
         )
+        nn.init.zeros_(self.predictor[-1].weight)
+        bias = self.predictor[-1].bias.data
+        bias[:d_latent].zero_()       # μ_dyn bias = 0
+        bias[d_latent:].fill_(-2.0)   # log_var bias = -2
+
+    def _context_for_genes(
+        self, s_context: torch.Tensor, xi_g: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Aggregate TF context into per-gene vectors.
+
+        Returns
+        -------
+        z_c_g      : (n_genes, d_latent)
+        attn_weights: (n_genes, n_tfs) if cross-attention, else None
+        """
+        if self.use_cross_attention:
+            # query: (1, n_genes, d_latent), key/value: (1, n_tfs, d_latent)
+            q = xi_g.unsqueeze(0)           # (1, n_genes, d_latent)
+            k = s_context.unsqueeze(0)      # (1, n_tfs,   d_latent)
+            z_c_g, attn_w = self.cross_attn(q, k, k, need_weights=True,
+                                             average_attn_weights=True)
+            # z_c_g:  (1, n_genes, d_latent) → (n_genes, d_latent)
+            # attn_w: (1, n_genes, n_tfs)    → (n_genes, n_tfs)
+            return z_c_g.squeeze(0), attn_w.squeeze(0)
+        else:
+            z_c_g = s_context.mean(dim=0, keepdim=True).expand(self.n_genes, -1)
+            return z_c_g, None
 
     def forward(self, expression: torch.Tensor, tf_mask: torch.Tensor) -> Stage1Output:
+        """VJEPA ELBO + B-JEPA PoE forward pass."""
+        # --- context encoder ---
         tf_expr   = expression[tf_mask]
-        s_context = self.context_encoder(tf_expr)           # (n_tfs, d_latent)
+        s_context = self.context_encoder(tf_expr)          # (n_tfs,  d_latent)
 
-        with torch.no_grad():
-            s_target = self.target_encoder(expression)      # (n_genes, d_latent)
+        # --- target encoder (EMA, no grad) ---
+        mu_q, log_var_q = self.target_encoder(expression)  # (n_genes, d_latent)
 
-        pred_s_target = (s_context.T @ self.W_init).T      # (n_genes, d_latent)
-        loss = F.mse_loss(pred_s_target, s_target)
+        # --- reparameterisation sample Z_T ~ q ---
+        eps = torch.randn_like(mu_q)
+        Z_T = mu_q + eps * (0.5 * log_var_q).exp()
+
+        # --- predictor: dynamics expert ---
+        xi_g             = self.gene_embedding.weight      # (n_genes, d_latent)
+        z_c_g, _         = self._context_for_genes(s_context, xi_g)
+        pred_in          = torch.cat([z_c_g, xi_g], dim=-1)
+        pred_out         = self.predictor(pred_in)
+        mu_dyn, pred_log_var = pred_out.chunk(2, dim=-1)
+        pred_log_var     = pred_log_var.clamp(-8.0, 4.0)
+
+        # --- B-JEPA PoE ---
+        prec_dyn = torch.exp(-pred_log_var)
+        prec_poe = prec_dyn + 1.0
+        var_phi  = 1.0 / prec_poe
+        mu_phi   = var_phi * prec_dyn * mu_dyn
+
+        # --- ELBO ---
+        nll  = 0.5 * (var_phi.log() + (Z_T - mu_phi).pow(2) / var_phi).mean()
+        kl   = -0.5 * (1.0 + log_var_q - mu_q.pow(2) - log_var_q.exp()).mean()
+        loss = nll + self.kl_weight * kl
 
         return Stage1Output(
-            pred_s_target=pred_s_target,
-            s_target=s_target,
+            loss=loss, nll=nll, kl=kl,
+            mu_q=mu_q, log_var_q=log_var_q,
+            mu_phi=mu_phi, var_phi=var_phi,
             s_context=s_context,
-            loss=loss,
         )
 
     @torch.no_grad()
@@ -123,14 +234,64 @@ class BJEPAStage1(nn.Module):
         self.target_encoder.update_ema(self.context_encoder)
 
     @torch.no_grad()
-    def get_W_init(self) -> torch.Tensor:
-        """Return trained W_init for Stage 2 warm start."""
-        return self.W_init.data.clone()
+    def get_W_init(
+        self, expression: torch.Tensor, tf_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Derive W_init for Stage 2 warm-start via OLS in latent space."""
+        tf_expr   = expression[tf_mask]
+        s_context = self.context_encoder(tf_expr)
+        mu_q, _   = self.target_encoder(expression)
+        device = s_context.device
+        A = s_context.T.cpu().float()
+        B = mu_q.T.cpu().float()
+        W = torch.linalg.lstsq(A, B).solution
+        return W.to(device)
+
+    @torch.no_grad()
+    def get_attention_scores(
+        self,
+        expression: torch.Tensor,
+        tf_mask: torch.Tensor,
+        gene_ids: list[str],
+        tf_ids: list[str],
+    ) -> "pd.DataFrame":
+        """Extract cross-attention weights as GRN edge scores.
+
+        Only valid when use_cross_attention=True.  Attention weight a_{g,d}
+        reflects how strongly gene g attends to TF d when predicting its
+        latent representation — interpretable as regulatory importance.
+
+        Returns
+        -------
+        DataFrame with columns [tf, target, score], sorted descending.
+        """
+        import pandas as pd
+        assert self.use_cross_attention, (
+            "get_attention_scores() requires use_cross_attention=True"
+        )
+        tf_expr   = expression[tf_mask]
+        s_context = self.context_encoder(tf_expr)          # (n_tfs, d_latent)
+        xi_g      = self.gene_embedding.weight             # (n_genes, d_latent)
+        _, attn_w = self._context_for_genes(s_context, xi_g)
+        # attn_w: (n_genes, n_tfs)
+        attn_w = attn_w.cpu().float().numpy()
+
+        tf_id_list   = tf_ids
+        gene_id_list = gene_ids
+        rows = [
+            {"tf": tf_id_list[d], "target": gene_id_list[g], "score": float(attn_w[g, d])}
+            for g in range(len(gene_id_list))
+            for d in range(len(tf_id_list))
+            if tf_id_list[d] != gene_id_list[g]
+        ]
+        df = pd.DataFrame(rows)
+        return df.sort_values("score", ascending=False).reset_index(drop=True)
 
     @classmethod
     def from_network(
         cls, network, d_latent=256, encoder_hidden=(512, 512),
-        encoder_dropout=0.1, ema_momentum=0.996,
+        encoder_dropout=0.1, ema_momentum=0.996, kl_weight=1.0,
+        predictor_hidden=256, use_cross_attention=False, num_attn_heads=4,
     ) -> "BJEPAStage1":
         return cls(
             n_samples=network.n_samples,
@@ -140,6 +301,10 @@ class BJEPAStage1(nn.Module):
             encoder_hidden=encoder_hidden,
             encoder_dropout=encoder_dropout,
             ema_momentum=ema_momentum,
+            kl_weight=kl_weight,
+            predictor_hidden=predictor_hidden,
+            use_cross_attention=use_cross_attention,
+            num_attn_heads=num_attn_heads,
         )
 
 

@@ -63,10 +63,12 @@ def run_network(nid: int, cfg: dict) -> dict:
 
     stage1 = BJEPAStage1.from_network(
         net,
-        d_latent        = d_latent,
-        encoder_hidden  = cfg["model"]["encoder_hidden"],
-        encoder_dropout = cfg["model"]["encoder_dropout"],
-        ema_momentum    = cfg["model"]["ema_momentum"],
+        d_latent         = d_latent,
+        encoder_hidden   = cfg["model"]["encoder_hidden"],
+        encoder_dropout  = cfg["model"]["encoder_dropout"],
+        ema_momentum     = cfg["model"]["ema_momentum"],
+        kl_weight        = cfg["model"].get("stage1_kl_weight", 1.0),
+        predictor_hidden = cfg["model"].get("predictor_hidden", 256),
     )
     stage2 = BJEPAStage2.from_network(
         net,

@@ -52,6 +52,8 @@ class TrainerConfig:
 class TrainHistory:
     # Stage 1
     s1_loss:     list[float] = field(default_factory=list)
+    s1_nll:      list[float] = field(default_factory=list)
+    s1_kl:       list[float] = field(default_factory=list)
     # Stage 2
     s2_reg_loss: list[float] = field(default_factory=list)
     s2_kl_loss:  list[float] = field(default_factory=list)
@@ -112,7 +114,7 @@ class BJEPATrainer:
         )
         sched = CosineAnnealingLR(opt, T_max=cfg.stage1_epochs, eta_min=cfg.stage1_lr * 0.1)
 
-        print(f"\n--- Stage 1: JEPA representation learning ({cfg.stage1_epochs} epochs) ---")
+        print(f"\n--- Stage 1: VJEPA/B-JEPA representation learning ({cfg.stage1_epochs} epochs) ---")
         t0 = time.perf_counter()
 
         for epoch in range(1, cfg.stage1_epochs + 1):
@@ -128,10 +130,18 @@ class BJEPATrainer:
             model.update_ema()
 
             self.history.s1_loss.append(out.loss.item())
+            self.history.s1_nll.append(out.nll.item())
+            self.history.s1_kl.append(out.kl.item())
 
             if epoch % cfg.eval_every == 0 or epoch == cfg.stage1_epochs:
                 elapsed = time.perf_counter() - t0
-                print(f"  S1 Epoch {epoch:4d}/{cfg.stage1_epochs}  jepa={out.loss.item():.4f}  [{elapsed:.0f}s]")
+                print(
+                    f"  S1 Epoch {epoch:4d}/{cfg.stage1_epochs}"
+                    f"  elbo={out.loss.item():.4f}"
+                    f"  nll={out.nll.item():.4f}"
+                    f"  kl={out.kl.item():.4f}"
+                    f"  [{elapsed:.0f}s]"
+                )
 
         # Save stage 1 checkpoint
         torch.save(model.state_dict(), self.results_dir / "stage1_final.pt")
@@ -149,10 +159,10 @@ class BJEPATrainer:
         # Compute fixed embeddings once (encoders frozen)
         print(f"\n--- Stage 2: Horseshoe regression in expression space ({cfg.stage2_epochs} epochs) ---")
 
-        # Warm-start mu_W from Stage 1's W_init
-        W_init = s1.get_W_init()
+        # Derive W_init from trained predictor via OLS in latent space
+        W_init = s1.get_W_init(self.expression, self.tf_mask)
         model.init_from_stage1(W_init)
-        print(f"  Warm-started mu_W from Stage 1 W_init (norm={W_init.norm():.3f})")
+        print(f"  Warm-started mu_W from Stage 1 predictor OLS (norm={W_init.norm():.3f})")
 
         # Build fixed expression matrices for Stage 2 (standardised per gene)
         # X_tf: (n_samples, n_tfs), Y: (n_samples, n_genes)
