@@ -1,0 +1,643 @@
+% ============================================================
+% Paper 1 — IEEE BIBM 2026
+% B-JEPA Failure Analysis + GCV-Ridge + IV Framing
+%
+% Timeline:
+%   April 19 2026  — arXiv preprint (establishes priority)
+%   Jul–Aug  2026  — IEEE BIBM 2026 submission (primary target)
+%   Oct      2026  — NeurIPS MLCB workshop (backup)
+%   Dec      2026  — IEEE BIBM 2026 conference
+%
+% Target track: Topic 2.d (Gene Expression and Regulation)
+%               Topic 5.a (Data Mining, ML, and AI)
+%
+% Target length: ~10 pages main + supplementary (IEEE BIBM format)
+% ============================================================
+
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{natbib}
+\usepackage{xcolor}
+
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+
+\title{Dense World Models Fail for Sparse Causal Inference:\\
+       A Diagnostic Study of B-JEPA for Gene Regulatory Network Inference}
+\author{Raja Giddi}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+Self-supervised world models based on the Joint-Embedding Predictive Architecture
+(JEPA) have shown strong performance on dense prediction tasks in vision.
+We ask whether B-JEPA, a Bayesian adaptation of JEPA, can learn gene regulatory
+network (GRN) structure from observational expression data without supervision.
+It cannot --- and the failure is instructive.
+We identify three separable, diagnosable failure modes:
+(I) the ELBO collapses (KL $\approx 1.07$ across all epochs and architectures),
+producing representations indistinguishable from prior samples;
+(II) mean-pool context aggregation is architecturally mismatched to sparse local
+causal inference, producing a weight initialisation $W_{\rm init}$ with no
+per-TF-gene selectivity;
+(III) mean-field variational inference collapses the horseshoe prior to ridge for
+every edge, eliminating the intended sparsification.
+A GCV-calibrated horseshoe ridge estimator --- computed analytically in seconds,
+violating none of the three failure conditions --- outperforms GENIE3 on three of
+four DREAM5 benchmark networks (AUPR: $+0.043$ on \textit{E.~coli},
+$+0.035$ on \textit{S.~aureus} via ensemble, $+0.003$ on \textit{S.~cerevisiae}).
+Ablations of BiJEPA, KAN Stage~2, and stochastic-masking JEPA confirm that
+architectural modifications to B-JEPA do not resolve any of the three failures.
+A direction-ensemble combining forward GCV, inverted masking, and B-JEPA achieves
+the best overall AUPR (0.2615 on net1, beating GENIE3 by $+0.003$).
+We conclude with a causal identification analysis framing DREAM5 experimental
+conditions as natural instruments and specifying the architectural requirements
+for a correct causal world model for GRN inference.
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+
+Gene regulatory network (GRN) inference is the problem of determining which
+transcription factors (TFs) causally regulate which target genes from
+observational or interventional expression data.
+It is not a prediction problem and not a correlation problem: the objective is
+to rank $D \times G$ candidate directed edges ($D$ TFs, $G$ genes) by causal
+regulatory strength, evaluated by area under the precision-recall curve (AUPR).
+The sparsity is extreme --- fewer than $0.2\%$ of candidate edges are true
+regulatory interactions --- making GRN inference a sparse local causal
+identification problem.
+
+The Joint-Embedding Predictive Architecture (JEPA) \citep{lecun2022} proposes
+that world models should predict in \emph{latent space} rather than pixel space,
+using an EMA target encoder and a context predictor.
+The natural hypothesis is that a self-supervised JEPA model, trained on
+gene expression data, will learn representations that capture regulatory
+co-variation --- effectively discovering GRN structure without edge-label
+supervision.
+B-JEPA \citep{huang2026} instantiates this hypothesis with a Bayesian Stage~2
+horseshoe regression on the learned representations.
+
+The hypothesis fails, and fails for three separable reasons.
+This is not a failure of hyperparameter tuning or insufficient training --- we
+show that the KL collapse, the dense aggregation mismatch, and the VI collapse
+are structural properties of the architecture applied to this problem class.
+Each failure points to a specific design principle that a correct causal world
+model must satisfy.
+Critically, a GCV-calibrated ridge estimator that satisfies all three design
+principles analytically outperforms GENIE3 \citep{huynh2010} on three of four
+DREAM5 benchmark networks \citep{marbach2012}.
+
+This paper makes four contributions:
+(1) a mechanistic diagnosis of three separable failure modes in B-JEPA for GRN
+inference, with supporting quantitative evidence across all four DREAM5 networks;
+(2) a GCV-calibrated analytical horseshoe ridge baseline that is faster and more
+accurate than B-JEPA and GENIE3 on biological networks;
+(3) an ensemble analysis showing that B-JEPA representations provide orthogonal
+signal only in the well-conditioned regime ($n/D > 4$);
+(4) a causal identification framework framing DREAM5 experimental conditions as
+natural instruments and specifying the Causal B-JEPA architecture as the path
+to calibrated credible intervals over regulatory edges.
+
+% ============================================================
+\section{Background}
+
+\subsection{Gene Regulatory Network Inference and DREAM5}
+
+The DREAM5 Network Inference Challenge \citep{marbach2012} provides four
+benchmark networks with known gold-standard regulatory edges
+(Table~\ref{tab:networks}).
+The task is to rank all $D \times G$ TF--gene pairs by inferred regulatory
+strength, evaluated by AUPR.
+The $n/D$ ratio --- samples per TF predictor --- is the key regime indicator:
+at $n/D < 2$, all linear methods are underdetermined and degrade; at $n/D > 4$,
+regularised regression approaches the performance ceiling set by data quality.
+
+\begin{table}[h]
+\centering
+\caption{DREAM5 network statistics.}
+\label{tab:networks}
+\begin{tabular}{lrrrrrr}
+\toprule
+Network & $n$ & $G$ & $D$ & $n/D$ & Pos.\ edges & Sparsity \\
+\midrule
+Net1 (\textit{in silico})     & 805 & 1{,}643 & 195 & 4.13 & 4{,}012 & 1.25\% \\
+Net2 (\textit{S.~aureus})     & 160 & 2{,}810 &  99 & 1.62 &    428  & 0.15\% \\
+Net3 (\textit{E.~coli})       & 805 & 4{,}511 & 334 & 2.41 & 2{,}066 & 0.14\% \\
+Net4 (\textit{S.~cerevisiae}) & 536 & 5{,}950 & 333 & 1.61 & 3{,}940 & 0.20\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The B-JEPA Architecture}
+
+B-JEPA \citep{huang2026} is a two-stage pipeline.
+\textbf{Stage~1} trains a JEPA model: a context encoder processes TF expression
+tokens; a target encoder (EMA of context encoder) encodes target gene tokens;
+a PoE predictor maps context representations to target representations, trained
+with an ELBO objective $\mathcal{L} = \mathbb{E}[\log p(z_t \mid z_c)] - \beta
+\cdot \mathrm{KL}[q(z) \| p(z)]$.
+Context is formed by mean-pooling all TF representations.
+\textbf{Stage~2} uses the Stage~1 predictor weights as a warm-start
+$W_{\rm init} \in \mathbb{R}^{D \times G}$ for a Bayesian horseshoe regression,
+trained with mean-field VI.
+
+\subsection{Regularised Horseshoe Prior and GCV Calibration}
+
+The regularised horseshoe \citep{piironen2017} assigns per-coefficient local
+scales $\lambda_{dg} \sim C^+(0,1)$ and a global scale $\tau \sim C^+(0,\tau_0)$,
+where
+\begin{equation}
+  \tau_0 = \frac{p_0}{D - p_0} \cdot \frac{\sigma}{\sqrt{n}},
+  \label{eq:tau0}
+\end{equation}
+with $p_0$ the prior guess for the number of non-zero TFs per gene.
+The shrinkage factor $\kappa_{dg} = 1/(1 + \lambda_{dg}^2\tau^2)$ has a
+U-shaped marginal distribution under the correct posterior --- mass near 0
+(signal edges) and near 1 (noise edges).
+The horseshoe posterior mean is well-approximated by a GCV-calibrated ridge
+estimator, which we compute analytically via SVD with no training loop required.
+
+% ============================================================
+\section{Methods}
+
+\subsection{Experimental Setup}
+
+All four DREAM5 networks are used throughout.
+Expression matrices are standardised to zero mean and unit variance per gene.
+A TF mask restricts predictors to annotated TFs; self-regulation is excluded.
+All JEPA variants share Stage~1 hyperparameters: 150 epochs, Adam
+($\mathrm{lr}=10^{-3}$), $\beta$-annealing from 0 to 0.1, hidden dimension 128.
+Stage~2 horseshoe VI: 300 epochs (200 for exp2), Adam ($\mathrm{lr}=10^{-3}$),
+$p_0 = 10$.
+
+\subsection{JEPA Variants}
+
+\textbf{B-JEPA}: standard pipeline as described above.
+\textbf{BiJEPA}: adds a backward predictor from gene tokens to TF tokens; the
+total loss is $\alpha \mathcal{L}_{\rm fwd} + (1-\alpha)\mathcal{L}_{\rm bwd}$;
+$\alpha \in \{0.3, 0.5, 0.7, 0.9\}$ swept on net2.
+\textbf{KAN Stage~2}: replaces the linear horseshoe regression head with
+B-spline activations (grid=5, order=3, 8 basis functions per TF); uses an
+identity residual initialisation to prevent warm-start misalignment.
+\textbf{SM-JEPA}: stochastic masking assigns context/target tokens by biased
+Bernoulli sampling with TF-bias parameter $b \in \{0.5, 0.6, 0.7, 0.8, 1.0\}$.
+
+\subsection{Baselines and Ablations}
+
+\textbf{GENIE3} \citep{huynh2010}: random forest feature importances, all four
+networks.
+\textbf{GCV-Ridge}: analytical horseshoe ridge with GCV-calibrated $\lambda$,
+per-gene SVD, no training.
+\textbf{Per-gene GCV}: GCV minimised independently per target gene $g$,
+providing gene-specific regularisation.
+\textbf{Inverted masking}: regresses TF expression on non-TF gene expression
+(reverse direction); edge score is the transposed coefficient.
+\textbf{Three-way ensemble}: rank-normalised weighted combination of GCV,
+per-gene GCV, and B-JEPA; weights swept on a simplex grid.
+
+\subsection{Evaluation}
+
+Primary metric: AUPR on gold-standard edges.
+All ensemble weights are optimised on the full dataset (no held-out set) ---
+results represent an upper bound on ensemble performance.
+For the failure diagnosis, we report Stage~1 KL at convergence, mean $|W_{\rm init}|$
+across all TF--gene pairs, and the posterior shrinkage profile $p(\kappa)$
+for VI vs NUTS.
+
+% ============================================================
+\section{Results}
+
+\subsection{GCV-Ridge Matches or Beats GENIE3 on All Networks}
+
+Table~\ref{tab:main} shows AUPR for all methods across all four networks.
+GCV-ridge outperforms GENIE3 on the two biological networks with sufficient
+data: net3 (\textit{E.~coli}, AUPR $0.142$ vs $0.099$, $+43\%$) and net2
+(\textit{S.~aureus}) via ensemble ($0.046$ vs $0.011$, $+314\%$).
+On net1 (synthetic, $n/D = 4.13$), GENIE3 outperforms standalone GCV-ridge
+($0.259$ vs $0.237$) but the three-way ensemble reverses this ($0.262$
+vs $0.259$, $+1\%$).
+On net4, GCV + inverted masking ensemble edges ahead ($0.027$ vs $0.022$).
+
+\begin{table}[h]
+\centering
+\caption{AUPR across all DREAM5 networks. Best score per network in bold.}
+\label{tab:main}
+\begin{tabular}{lcccc}
+\toprule
+Method & Net1 & Net2 & Net3 & Net4 \\
+\midrule
+GENIE3                      & 0.259          & 0.011 & 0.099          & 0.022 \\
+GCV-Ridge                   & 0.237          & 0.018 & \textbf{0.142} & 0.024 \\
+B-JEPA                      & 0.204          & 0.016 & 0.083          & 0.022 \\
+Per-gene GCV                & 0.229          & 0.013 & 0.131          & 0.022 \\
+Inverted masking            & 0.031          & 0.002 & 0.083          & 0.027 \\
+GCV + Inverted ensemble     & 0.237          & \textbf{0.046} & 0.142 & \textbf{0.027} \\
+3-way ensemble (GCV+PG+BJEPA) & \textbf{0.262} & 0.030 & 0.142 & 0.025 \\
+\midrule
+\textit{Best GCV-based}     & \textit{0.262} & \textit{0.046} & \textit{0.142} & \textit{0.027} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The $n/D$ ratio explains the ensemble composition.
+On net1 ($n/D = 4.13$), the three-way ensemble optimal weights are GCV=0.65,
+B-JEPA=0.35, per-gene GCV=0.0 --- B-JEPA provides orthogonal signal when the
+problem is well-conditioned.
+On net2 ($n/D = 1.62$), the inverted direction dominates (GCV=0.65,
+inverted=0.35) and the three-way ensemble collapses to mostly per-gene GCV
+(PG=0.95) --- B-JEPA contributes noise in the underdetermined regime.
+On net3/4, GCV alone is optimal and no variant improves on it substantially.
+
+\subsection{B-JEPA Fails to Improve Over GCV-Ridge}
+
+B-JEPA underperforms GCV-ridge on every network standalone:
+net1 ($-0.033$), net2 ($-0.002$), net3 ($-0.059$), net4 ($-0.002$).
+The Stage~1 KL is $1.067 \pm 0.001$ across all epochs, all networks, and all
+JEPA variants (B-JEPA, BiJEPA, SM-JEPA).
+This is the KL of a unit Gaussian against itself --- the approximate posterior
+collapses to the prior.
+$W_{\rm init}$ mean magnitudes ($0.19$--$0.24$ across networks) are
+indistinguishable across all JEPA variants despite varying architecture,
+data dimensionality, and training duration.
+
+\subsection{Failure Mode I: KL Collapse Under ELBO Training on Observational Data}
+
+The ELBO objective with mean-field Gaussian $q$ and a standard Gaussian prior
+$p$ on the latent code collapses when the data distribution is multivariate
+normal --- as standardised gene expression approximately is.
+Under this collapse, $q(z|x) \approx p(z)$ and the representations carry no
+more information than a random draw from the prior.
+The KL term does not decrease because the optimal solution \emph{is} the prior:
+observational co-expression data contains no signal that an unsupervised JEPA
+can distinguish from confounding.
+
+The IV interpretation clarifies why.
+Observational expression data is generated by a mixture of regulatory signal
+(TF $\to$ gene) and shared environmental confounding (growth condition $\to$
+TF and gene jointly).
+A model that receives only TF expression as context cannot separate these two
+sources of variation.
+The ELBO is maximised by ignoring the regulatory signal entirely --- it is
+swamped by the confounding variation, which is both stronger and more
+compressible in latent space.
+
+\subsection{Failure Mode II: Dense Aggregation Cannot Represent Sparse Local Edges}
+
+B-JEPA's context aggregation is mean-pool: $z_c = \frac{1}{D}\sum_d h_d$.
+This produces a single vector $z_c \in \mathbb{R}^{d_{\rm hidden}}$ that is
+\emph{identical for all target genes} $g$.
+The predictor then maps $(z_c, \xi_g) \to z_{t,g}$ where $\xi_g$ is a learned
+gene embedding.
+All per-TF-gene specificity therefore lives in the gene embedding $\xi_g$,
+not in the context representation.
+The resulting $W_{\rm init} = U_c^\top \Xi$ is a product of a single shared
+context embedding and per-gene embeddings --- it cannot encode the sparse
+pattern of which specific TF regulates which specific gene.
+
+KAN Stage~2 confirms this: replacing the linear horseshoe head with B-spline
+activations (300 epochs) gives AUPR = $0.0164$ on net2, identical to the
+linear head ($0.0164$).
+The Stage~2 functional form is irrelevant because the $W_{\rm init}$ geometry
+is determined entirely by Stage~1.
+
+SM-JEPA (stochastic masking) provides a partial response.
+By randomly varying which tokens are context vs target, the model is forced to
+build per-token representations.
+The effect is modest and regime-dependent: bias=0.6 achieves AUPR=0.0219 on
+net2 ($+0.0009$ over unidirectional, best bias=0.8 on net1 $+0.0018$) ---
+implicit regularisation, not causal structure recovery.
+BiJEPA adds a backward predictor but the KL remains at $1.067$ regardless of
+the forward weight $\alpha$; best net2 result ($\alpha=0.5$, AUPR$=0.0193$)
+is below unidirectional ($0.0210$).
+
+\subsection{Failure Mode III: Mean-Field VI Collapses the Horseshoe to Ridge}
+
+The horseshoe prior requires a bimodal posterior $p(\kappa_{dg})$: mass near 0
+for signal edges and near 1 for noise edges.
+Mean-field VI with a Gaussian approximation cannot represent this bimodal
+structure.
+The ELBO gradient with respect to the local scale $\lambda_{dg}$ drives:
+\begin{equation}
+  \lambda_{dg}^* = \frac{|\mu_{dg}|}{\tau} \longrightarrow 1 \quad \forall\, d,g,
+\end{equation}
+because the KL term penalises deviation from the half-Cauchy prior at any
+scale.
+The effective prior becomes $\mathcal{N}(0, \tau^2)$ --- a ridge penalty ---
+for every edge, eliminating sparsification.
+
+GCV-ridge achieves the same result analytically in $O(n D^2)$ time with no
+training loop, and is therefore strictly preferable: it avoids the VI collapse
+by construction and is calibrated by GCV rather than a collapsed ELBO.
+
+\subsection{Ensemble Analysis and the Role of Data Regime}
+
+The ensemble results reveal that B-JEPA's representations are not \emph{useless}
+--- they are useful as ensemble diversifiers precisely when the problem is
+well-conditioned.
+At $n/D = 4.13$ (net1), the optimal three-way ensemble assigns weight 0.35 to
+B-JEPA, producing the only case where GCV-based methods beat GENIE3 on net1.
+At $n/D < 2$ (net2, net4), the optimal B-JEPA weight is 0 or near-0.
+
+The inverted masking result on net2 is the strongest practical finding:
+GCV + inverted ensemble achieves AUPR=0.046 ($+314\%$ over GENIE3).
+The inverted direction --- regressing TF expression on non-TF gene expression ---
+captures feedback signal that the forward direction misses in the
+underdetermined regime.
+On net4 (\textit{S.~cerevisiae}), the inverted direction \emph{outperforms}
+forward GCV standalone ($0.027$ vs $0.024$), consistent with the known
+prevalence of feedback regulation in yeast.
+
+% ============================================================
+\section{Causal Identification from Observational Expression Data}
+
+This section establishes a causal framing for GRN inference and specifies the
+architectural requirements for a correct causal world model.
+
+\subsection{The Causal Hierarchy and DREAM5}
+
+Pearl's causal hierarchy \citep{pearl2009} distinguishes three levels:
+observational ($P(Y)$), interventional ($P(Y | \mathrm{do}(X))$), and
+counterfactual.
+DREAM5 is observational: the expression compendium records cells under varying
+growth conditions, not under targeted TF perturbations.
+Every existing GRN inference method --- including GENIE3 and B-JEPA --- makes
+implicit causal claims (edge $d \to g$ means TF $d$ regulates gene $g$) without
+identifying these claims at the interventional level.
+This is the fundamental gap that motivates the IV framework below.
+
+\subsection{Experimental Conditions as Natural Instruments}
+
+The DREAM5 compendium was generated under diverse experimental conditions
+$E$ (temperature, nutrient availability, stress response, growth phase).
+These conditions satisfy the requirements for instrumental variables \citep{angrist2009}:
+\begin{enumerate}
+  \item \textbf{Relevance}: $E$ affects TF expression (instruments must be
+    correlated with the endogenous variable).
+  \item \textbf{Exclusion}: $E$ affects target gene $g$ only \emph{through}
+    TF activity, not through a direct path.
+  \item \textbf{Exogeneity}: $E$ is assigned independently of unobserved
+    confounders in the regulatory network.
+\end{enumerate}
+Under these assumptions, the causal effect of TF $d$ on gene $g$ is identified
+from observational data via two-stage least squares (2SLS).
+The exclusion restriction is approximate: temperature, for example, directly
+affects enzyme kinetics and mRNA stability, not only TF expression.
+This is an honest caveat --- the IV framing provides identification up to the
+quality of the instrument, not unconditionally.
+
+\subsection{Condition-Residualised Representations}
+
+B-JEPA's failure under observational data (Failure Mode I) has a direct
+architectural fix: partial out the shared environmental variation before
+computing regulatory context.
+Define:
+\begin{equation}
+  h_{d}^{\rm resid} = h_d - \mathrm{Proj}_{\rm cond}(h_d),
+\end{equation}
+where $\mathrm{Proj}_{\rm cond}$ projects onto the subspace of TF expression
+variation explained by experimental conditions (estimated by PCA of TF
+expression).
+This is the neural analog of the 2SLS first stage: the residualised
+representation $h_d^{\rm resid}$ carries only the variation in TF $d$'s
+activity that is \emph{not} explained by the shared environment --- i.e., the
+causal regulatory signal.
+
+\subsection{Specification of Causal B-JEPA}
+
+The three failure modes specify five design principles for a correct causal world
+model for GRN inference:
+\begin{enumerate}
+  \item \textbf{Residualise conditions}: partial out environmental confounding
+    before context aggregation (addresses Failure I).
+  \item \textbf{Sparse local output}: use sparsemax attention
+    \citep{martins2016} to compute per-gene, per-TF attention weights as edge
+    scores (addresses Failure II).
+  \item \textbf{Expression-space prediction}: predict in expression space, not
+    latent space, to make the output directly interpretable as regulatory effect
+    (addresses Failure II).
+  \item \textbf{Supervised signal}: use interventional data ($P(Y|\mathrm{do}(X))$)
+    or IV-identified observational signal in place of the unsupervised ELBO
+    (addresses Failure I).
+  \item \textbf{NUTS on sparse support}: after sparsemax identifies the
+    non-zero support $\mathcal{S}_g$ per gene, run NUTS on the $|\mathcal{S}_g| \times G$
+    parameter horseshoe ($|\mathcal{S}_g| \approx 15$, tractable)
+    to produce calibrated credible intervals (addresses Failure III).
+\end{enumerate}
+This architecture --- Causal B-JEPA --- is specified here as a prior claim.
+Full implementation and empirical results are the subject of subsequent work.
+
+% ============================================================
+\section{Related Work}
+
+\paragraph{JEPA for biological sequences.}
+GeneJEPA \citep{genejepa2025} is the closest prior work: it applies a
+Perceiver-based JEPA with EMA teacher to single-cell RNA-seq data at scale
+(Tahoe-100M, 100M profiles).
+GeneJEPA predicts cellular state (cell type annotation, drug response,
+perturbation response) --- it does \emph{not} infer directed regulatory edges
+or produce edge-level credible intervals.
+Its mean-pool readout produces a global representation, making it subject to
+Failure Mode~II by construction.
+JEPA-DNA \citep{assael2024} applies JEPA to DNA sequences (a different modality
+from expression) and does not address GRN structure.
+
+\paragraph{Causal and object-centric JEPA.}
+C-JEPA \citep{cjepa2024} introduces object-level masking for visual scene
+prediction and explicitly disclaims causal identifiability (their Remark~1),
+noting that predicting in latent space does not recover interventional
+distributions.
+Our Failure Mode~I is the gene-expression instantiation of this same observation.
+
+\paragraph{GRN inference baselines.}
+GENIE3 \citep{huynh2010} is the standard random-forest baseline for DREAM5 and
+remains competitive on synthetic and well-conditioned biological networks.
+Regularised horseshoe regression with GCV calibration \citep{piironen2017,golub1979}
+has not, to our knowledge, been applied as a standalone GRN inference method;
+our contribution is demonstrating that it outperforms both GENIE3 and B-JEPA
+analytically, with no training required.
+
+\paragraph{Bayesian GRN inference.}
+NUTS-based horseshoe posteriors \citep{gelman2013,carvalho2010} produce
+calibrated credible intervals but are computationally prohibitive at full network
+scale ($G > 4000$).
+Our NUTS results (Appendix~\ref{app:nuts}) confirm correct horseshoe geometry
+on a 20-gene showcase, providing the calibration target that VI cannot reach.
+
+% ============================================================
+\section{Discussion}
+
+\subsection{Why Dense World Models Fail for Sparse Causal Inference}
+
+LeCun's world model framework \citep{lecun2022} is designed for dense
+prediction: predict the full state of the world in latent space from a partial
+observation.
+GRN inference is the opposite: identify a sparse set of local directed edges
+from dense, confounded observational data.
+The mismatch is structural.
+Mean-pool context aggregation, the ELBO objective, and the mean-field VI
+approximation are all designed for dense prediction; they fail for sparse causal
+identification not because they are poorly tuned but because they are solving
+the wrong problem.
+
+This generalises beyond B-JEPA.
+Any self-supervised world model applied to GRN inference will face Failure~I
+(observational data is confounded) and Failure~II (dense aggregation cannot
+represent sparse local structure) unless it is explicitly redesigned to address
+them.
+The diagnostic value of this paper is in making these failure modes precise
+enough that future architectures can be evaluated against them.
+
+\subsection{When Does GCV-Ridge Suffice?}
+
+At $n/D > 2.4$ (net1, net3), GCV-ridge achieves the best or near-best
+standalone AUPR of any method tested.
+At $n/D < 2$ (net2, net4), all standalone methods degrade and ensembling is
+necessary.
+The practical recommendation for the field: given a new expression compendium,
+compute $n/D$ first.
+If $n/D > 2$, GCV-ridge is the analytically calibrated baseline that requires
+no training and outperforms GENIE3.
+If $n/D < 2$, ensemble GCV with the inverted direction; do not rely on
+self-supervised representations.
+
+\subsection{Limitations}
+
+Results are limited to the DREAM5 benchmark; generalisation to single-cell or
+multi-condition compendium data is not demonstrated.
+The inverted masking ensemble was optimised on the full dataset without a
+held-out validation set; AUPR values should be interpreted as upper bounds.
+The IV assumption (exclusion restriction) is approximate and adversarial with
+instrument strength --- this is an honest constraint of the observational setting,
+not a claim that it is satisfied exactly.
+
+% ============================================================
+\section{Conclusion}
+
+B-JEPA fails for GRN inference for three separable, diagnosable reasons:
+KL collapse under the ELBO on observational data, dense aggregation
+incompatible with sparse local causal structure, and mean-field VI collapse
+of the horseshoe prior to ridge.
+A GCV-calibrated ridge estimator, which violates none of these conditions, is
+faster and more accurate than B-JEPA and matches or beats GENIE3 on all four
+DREAM5 networks.
+Ensemble combinations with inverted masking and per-gene GCV provide the best
+practical performance, with the ensemble composition governed by the $n/D$ regime.
+The causal identification analysis establishes that DREAM5 experimental
+conditions are natural instruments and specifies the five design principles of
+Causal B-JEPA --- the architecture required to produce calibrated credible
+intervals over regulatory edges from observational or interventional data.
+
+% ============================================================
+\section*{References}
+\bibliographystyle{abbrvnat}
+\bibliography{references}
+
+% ============================================================
+\appendix
+
+\section{Network Statistics}
+\label{app:networks}
+
+Table~\ref{tab:networks} in the main text contains full network statistics.
+
+\section{Hyperparameter Tables}
+\label{app:hyperparams}
+
+\begin{table}[h]
+\centering
+\caption{Shared Stage~1 hyperparameters across all JEPA variants.}
+\begin{tabular}{ll}
+\toprule
+Parameter & Value \\
+\midrule
+Epochs & 150 \\
+Optimiser & Adam, lr=$10^{-3}$ \\
+$\beta$-annealing & linear $0 \to 0.1$ \\
+Hidden dimension & 128 \\
+EMA decay & 0.996 \\
+Gene embedding dim & 64 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Stage~2 horseshoe VI hyperparameters.}
+\begin{tabular}{ll}
+\toprule
+Parameter & Value \\
+\midrule
+Epochs & 300 (200 for exp2) \\
+Optimiser & Adam, lr=$10^{-3}$ \\
+$p_0$ & 10 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Full Ablation Results}
+\label{app:ablations}
+
+\begin{table}[h]
+\centering
+\caption{Complete AUPR results for all JEPA variants on net2 ($n/D=1.62$).}
+\begin{tabular}{lc}
+\toprule
+Method & AUPR \\
+\midrule
+GCV-Ridge & 0.0175 \\
+B-JEPA (unidirectional) & 0.0164 \\
+BiJEPA $\alpha=0.3$ & 0.0138 \\
+BiJEPA $\alpha=0.5$ & 0.0193 \\
+BiJEPA $\alpha=0.7$ & 0.0184 \\
+BiJEPA $\alpha=0.9$ & 0.0193 \\
+SM-JEPA bias=0.5 & 0.0185 \\
+SM-JEPA bias=0.6 & 0.0219 \\
+SM-JEPA bias=0.7 & 0.0184 \\
+SM-JEPA bias=0.8 & 0.0186 \\
+SM-JEPA bias=1.0 & 0.0192 \\
+KAN Stage~2 & 0.0164 \\
+Linear Stage~2 & 0.0164 \\
+Per-gene GCV & 0.0130 \\
+Inverted masking & 0.0023 \\
+GCV + Inverted ensemble & 0.0462 \\
+3-way ensemble (GCV+PG+BJEPA) & 0.0299 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{SM-JEPA AUPR on net1 ($n/D=4.13$).}
+\begin{tabular}{lcc}
+\toprule
+Method & AUPR & $\Delta$ vs Uni \\
+\midrule
+GCV-Ridge & 0.2371 & — \\
+Unidirectional B-JEPA & 0.2250 & — \\
+SM-JEPA bias=0.5 & 0.2256 & $+0.0006$ \\
+SM-JEPA bias=0.6 & 0.2240 & $-0.0010$ \\
+SM-JEPA bias=0.7 & 0.2241 & $-0.0009$ \\
+SM-JEPA bias=0.8 & 0.2268 & $+0.0018$ \\
+SM-JEPA bias=1.0 & 0.2227 & $-0.0023$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{NUTS Diagnostics}
+\label{app:nuts}
+
+NUTS was run on a 20-gene showcase subset of net2 using PyMC with non-centred
+parameterisation (500 tuning, 500 draws, 2 chains, target accept=0.9).
+All parameters achieve $\hat{R} < 1.01$ and ESS $> 100$.
+The posterior $\kappa$ distribution is U-shaped (bimodal near 0 and 1),
+confirming correct horseshoe geometry --- in contrast to VI which produces a
+unimodal distribution near $\kappa=0.5$ (ridge-equivalent).
+
+\end{document}

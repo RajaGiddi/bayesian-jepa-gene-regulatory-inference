@@ -1,0 +1,324 @@
+% ============================================================
+% Paper 2 — Causal B-JEPA
+% Uncertainty-Aware Gene Regulatory Network Inference
+% from Interventional and Observational Data
+%
+% Timeline:
+%   Summer 2026   — Build architecture, run experiments
+%   Oct    2026   — NeurIPS MLCB preliminary results (if ready)
+%   Early  2027   — Genome Biology / Nature Computational Science / NeurIPS 2027
+%
+% Target length: ~15 pages main text + supplementary
+% ============================================================
+
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{natbib}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+\newcommand{\placeholder}[1]{\textcolor{gray}{[PLACEHOLDER: #1]}}
+
+\title{Causal B-JEPA: Sparse Attention World Models for\\
+       Uncertainty-Quantified Gene Regulatory Network Inference}
+\author{Raja Giddi}
+\date{2027}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+% Central claim (4 sentences):
+% 1. Standard world models fail for GRN inference because they implement
+%    dense global prediction when the problem requires sparse local causal identification.
+% 2. Causal B-JEPA addresses three separable failure modes from Paper 1 simultaneously.
+% 3. Sparsemax attention weights are the regulatory network; NUTS on the sparse
+%    support produces calibrated credible intervals — the first in GRN inference.
+% 4. Comparison of observational IV and interventional training quantifies the
+%    causal identification gap for specific edge classes.
+% ~250 words.
+\todo{Abstract}
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+% Paragraph 1: Paper 1 finding — dense world models fail for sparse causal inference.
+%   This paper builds the architecture Paper 1 specified.
+%   One sentence establishing prior claim: cite Paper 1.
+%
+% Paragraph 2: The three components GRN inference requires.
+%   Causal identification strategy (IV or interventional).
+%   Sparse local output head in expression space.
+%   Tractable calibrated posteriors over sparse support.
+%
+% Paragraph 3: Causal B-JEPA delivers all three.
+%   Two versions (A: observational IV, B: interventional).
+%   First calibrated credible intervals over regulatory edges.
+%   Uncertainty-guided experimental prioritization.
+%
+% Paragraph 4: Paper contributions enumerated.
+\todo{Introduction}
+
+% ============================================================
+\section{Background}
+
+\subsection{Failure Analysis of Dense World Models for GRN Inference}
+% Brief summary of Paper 1 findings. ~1 page.
+% Three failures: observational data, dense prediction, VI collapse.
+% GCV-ridge as the practical baseline this paper must beat.
+\todo{Paper 1 summary}
+
+\subsection{Instrumental Variables for Observational Causal Inference}
+% Pearl's causal hierarchy. IV setup: E -> TF -> gene.
+% Exclusion restriction. Instrument strength. 2SLS.
+% Connection to condition-residualized representations.
+% Honest caveats (Caveat 1, 2, 3 from brainstorm).
+\todo{IV background}
+
+\subsection{Perturb-seq Interventional Data}
+% Replogle et al. 2022. K562 genome-wide CRISPRi.
+% 9,866 knockdowns. 2.5M single cells. Pseudo-bulk construction.
+% Delta y = y_k - y_0. Action labels a_k.
+% Why this is P(Y|do(X)) and observational compendium is not.
+\todo{Perturb-seq background}
+
+\subsection{Sparsemax and Structured Sparsity}
+% Sparsemax (Martins \& Astudillo 2016) vs softmax.
+% Differentiable sparse probability simplex projection.
+% Why sparsemax not top-K: differentiability, training stability.
+% Convergence of nonzero support during training.
+\todo{Sparsemax background}
+
+% ============================================================
+\section{Architecture}
+
+\subsection{Design Principles}
+% The five principles from the brainstorm document.
+% Each principle is a direct response to a diagnosed failure from Paper 1.
+% Table: failure -> principle -> architectural component.
+\todo{Design principles}
+
+\subsection{Stage 1 — Causal Context Encoder}
+% Transformer encoder over D TF tokens.
+% Token = TF identity embedding + expression value.
+% Self-attention among TFs: learns regulatory crosstalk.
+% Action conditioning: perturbed TF receives action embedding.
+% Condition residualization: h_tf,d^resid = h_tf,d - Proj_condition(h_tf,d).
+%   PCA of TF expression for observational IV version.
+%   Explicit action label for interventional version.
+% Output: H_tf in R^{D x d}.
+% Why no EMA: direct supervised signal replaces self-distillation.
+\todo{Stage 1 architecture}
+
+\subsection{Stage 2 — Sparse Causal Predictor}
+% For each target gene g:
+%   Raw scores: e_{dg} = w_g^T tanh(W_d h_{tf,d}^resid)
+%   Sparse attention: alpha_{dg} = sparsemax(e_{dg})
+%   Context: context_g = sum_d alpha_{dg} h_{tf,d}
+%   Prediction: delta_hat_g = context_g W_out + b_g   (expression space)
+%
+% Training objective:
+%   L = sum_k sum_g (delta_hat_g^k - delta_y_g^k)^2  +  lambda * ||alpha||_0
+%   MSE in expression space + sparsity penalty on attention support.
+%
+% Why expression space not latent: direct interpretability.
+% Why sparsemax: differentiable sparse selection.
+% Edge scores: s_{dg} = alpha_{dg} (primary) or |w_{dg}| * alpha_{dg} (refined).
+\todo{Stage 2 architecture}
+
+\subsection{Stage 3 — Bayesian Uncertainty Layer}
+% NUTS on sparse support S_g = {d : alpha_{dg} > 0}.
+% Per-gene regression: y_g = X_tf[:,S_g] beta_g + epsilon_g.
+% Regularised horseshoe prior (Piironen \& Vehtari 2017).
+%   Principled tau_0g per gene: (p_0 / (K_g - p_0)) * (sigma_g / sqrt(n)).
+% Warm start: GCV-ridge point estimate from Paper 1.
+%   GCV solution is near posterior mode -> short burn-in.
+% NUTS settings: 4 chains, 1000 samples, target_accept=0.9.
+%   Non-centred parameterisation for tau and lambda.
+% Tractability argument: K_g * G vs D * G parameters.
+%   K_g ~ 15, G ~ 4000: 60K vs 1.2M. NUTS feasible at 60K.
+%
+% Outputs per edge:
+%   Posterior mean E[beta_{dg} | data]
+%   95\% credible interval
+%   Posterior inclusion P(|beta_{dg}| > threshold | data)
+%   Variance Var(beta_{dg} | data) -- experimental design signal
+\todo{Stage 3 architecture}
+
+\subsection{Algorithm Summary}
+% Algorithm box: full Causal B-JEPA training + inference pipeline.
+\todo{Algorithm box}
+
+% ============================================================
+\section{Experimental Design}
+
+\subsection{Two Training Regimes}
+% Version A — Observational IV (DREAM5):
+%   Training data: DREAM5 net3 E. coli expression compendium.
+%   Causal identification: condition-residualized representations.
+%   Instrument: experimental conditions as natural experiments.
+%   Evaluation: DREAM5 gold standard AUPR + AUROC.
+%
+% Version B — Interventional (Replogle K562):
+%   Training data: Replogle et al. 2022 K562_gwps CRISPRi.
+%   Causal identification: true P(Y|do(X)).
+%   Action conditioning: knockdown identity.
+%   Evaluation: CausalBench + held-out knockdown prediction.
+%
+% Comparison: Version A vs Version B. Divergence = IV assumption violation.
+\todo{Two versions}
+
+\subsection{Baselines}
+% GENIE3 (Paper 1 baseline).
+% GCV-ridge (Paper 1 positive contribution -- the bar to beat).
+% B-JEPA (Paper 1 primary method -- should be beaten substantially).
+% SCENIC+ (state of the art for human GRN inference).
+% scGPT regulatory head (if applicable).
+\todo{Baselines}
+
+\subsection{Evaluation Metrics}
+% Primary (CausalBench):
+%   Mean Wasserstein distance on held-out knockdowns.
+%   False omission rate (FOR) on absent edges.
+%
+% Secondary (DREAM5):
+%   AUPR. AUROC. Rank correlation with GCV-ridge.
+%
+% Novel (calibration):
+%   95\% credible interval coverage on held-out Replogle knockdowns.
+%   Target: empirical coverage = 0.95 if calibrated.
+%
+% Novel (experimental design):
+%   Precision at top-k high-uncertainty moderate-confidence edges.
+%   These are the novel interaction candidates for experimental validation.
+\todo{Evaluation metrics}
+
+% ============================================================
+\section{Results}
+
+\subsection{Version A: Observational IV on DREAM5}
+% AUPR vs GCV-ridge, GENIE3, B-JEPA.
+% Does condition residualization help vs no residualization?
+% Sensitivity analysis: number of PCs removed.
+% Does sparsemax attention find biologically plausible regulators?
+% Figure: attention weight distribution. Top regulators per gene.
+\todo{Version A results}
+
+\subsection{Version B: Interventional on Replogle K562}
+% CausalBench Wasserstein distance.
+% Held-out knockdown prediction AUPR.
+% Calibration coverage: does 95\% CI cover 95\% of true effects?
+% Figure: calibration plot (empirical vs nominal coverage).
+\todo{Version B results}
+
+\subsection{Comparing the Two Versions}
+% Where do A and B agree? These are causally robust edges.
+% Where do they diverge? These are IV assumption violations.
+% Biological interpretation of divergence points.
+% Do divergence points correspond to known indirect regulatory effects?
+\todo{Version comparison}
+
+\subsection{Uncertainty-Guided Experimental Prioritization}
+% Top-k edges by Var(beta_{dg}).
+% High variance + moderate confidence = most informative to validate.
+% Comparison against random selection and confidence-ranked selection.
+% If wet lab validation available: precision on experimentally confirmed edges.
+\todo{UQ results}
+
+\subsection{Calibration Analysis}
+% Figure: calibration coverage curve.
+% 95\% CI coverage at different confidence thresholds.
+% Comparison: NUTS vs VI vs bootstrap.
+% Key claim: NUTS is calibrated, VI is not.
+\todo{Calibration results}
+
+% ============================================================
+\section{Discussion}
+
+\subsection{What Makes Causal B-JEPA Possible}
+% Three enabling components that had to be resolved in Paper 1:
+%   GCV-ridge warm start (from Paper 1 analytical horseshoe).
+%   Failure analysis justifying sparse expression-space output.
+%   IV framing justifying observational causal claims.
+% Paper 1 is not just motivation -- it is the foundation.
+\todo{What makes it possible}
+
+\subsection{The Causal Identification Gap}
+% Quantification of the A vs B difference.
+% When is observational IV sufficient? When is interventional required?
+% Practical guidance: if n/D > 3 and conditions are diverse, IV suffices.
+% If edges involve indirect regulation or TF post-translational control, need Perturb-seq.
+\todo{Causal identification gap}
+
+\subsection{Limitations}
+% Assumption 1: TF expression proxies TF regulatory activity (weakest for eukaryotes).
+% Assumption 2: Exclusion restriction (approximate, adversarial with instrument strength).
+% Assumption 3: Sparse regulatory structure (K_g ~ 15 -- may be wrong for master regulators).
+% K562 -> E. coli transfer: not the claim. Version A is evaluated on DREAM5 directly.
+\todo{Limitations}
+
+\subsection{Connection to the Virtual Cell Program}
+% CZI virtual cell initiative. Perturb-seq as training data.
+% Causal B-JEPA as a module for regulatory structure discovery.
+% Uncertainty quantification as the key gap in current virtual cell models.
+% Future: multi-organism training, cell-type-specific GRN inference.
+\todo{Virtual cell connection}
+
+% ============================================================
+\section{Conclusion}
+\todo{Conclusion}
+
+% ============================================================
+\section*{References}
+\bibliographystyle{abbrvnat}
+\bibliography{references}
+% Key citations to add:
+% Paper 1 (this work -- cite arXiv preprint)
+% Replogle et al. 2022 (Perturb-seq K562)
+% Martins \& Astudillo 2016 (sparsemax)
+% Piironen \& Vehtari 2017 (regularised horseshoe)
+% Pearl 2009 (causality)
+% Angrist \& Pischke 2009 (IV)
+% CausalBench (Chevalley et al. 2023)
+% SCENIC+ (Bravo Gonzalez-Blas et al. 2023)
+% scGPT (Wang et al. 2024)
+% LeCun 2022 (world models / JEPA)
+% Huang 2026 (BiJEPA)
+
+% ============================================================
+\appendix
+
+\section{Proof: Sparsemax Attention Converges to 2SLS Under Linear Conditions}
+% Informal theorem: under linear encoder, exact condition residualization,
+% and linear predictor, sparsemax attention weights converge to 2SLS coefficients.
+% This connects the architecture to classical IV estimation theory.
+\todo{2SLS convergence theorem}
+
+\section{Replogle Dataset Details}
+% K562 cell line. CRISPRi mechanism. Pseudo-bulk construction.
+% Train/validation/test split. Which knockdowns are held out.
+% Data preprocessing: normalisation, pseudo-bulk aggregation.
+\todo{Replogle details}
+
+\section{Hyperparameter Sensitivity}
+% Sparsemax temperature. Number of PCA components removed.
+% K_g prior specification. NUTS settings sensitivity.
+\todo{Hyperparameter sensitivity}
+
+\section{Full CausalBench Results}
+% All metrics across all methods. Statistical significance.
+\todo{Full CausalBench table}
+
+\section{NUTS Diagnostics for Stage 3}
+% R-hat, ESS, trace plots.
+% Comparison: Stage 3 NUTS vs Paper 1 NUTS (warm start reduces burn-in by X\%).
+\todo{NUTS diagnostics}
+
+\end{document}
